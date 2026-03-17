@@ -337,9 +337,12 @@ General requirements:
   - guessedWordType
   - promptFamily
   - 2 short safeExampleSentences
+  - 2 exampleTranslations
 
 Important sentence rules:
 - safeExampleSentences must be in the TARGET language.
+- exampleTranslations must translate the matching example sentences into the BASE language.
+- Keep each translation natural, clear, and complete.
 - The term should appear naturally in at least one example sentence when possible.
 - Do not use overly advanced sentence structures for beginner mode.
 - Keep punctuation simple.
@@ -426,6 +429,12 @@ const generationSchema = {
               maxItems: 2,
               items: { type: "string" },
             },
+            exampleTranslations: {
+              type: "array",
+              minItems: 2,
+              maxItems: 2,
+              items: { type: "string" },
+            },
           },
           required: [
             "term",
@@ -433,6 +442,7 @@ const generationSchema = {
             "guessedWordType",
             "promptFamily",
             "safeExampleSentences",
+            "exampleTranslations",
           ],
         },
       },
@@ -915,6 +925,10 @@ app.post("/generateSet", async (req, res) => {
           ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
           : [];
 
+        let exampleTranslations = Array.isArray(item.exampleTranslations)
+          ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
+          : [];
+
         if (safeExampleSentences.length === 0) {
           safeExampleSentences = [term, term];
         } else if (safeExampleSentences.length === 1) {
@@ -923,12 +937,21 @@ app.post("/generateSet", async (req, res) => {
           safeExampleSentences = safeExampleSentences.slice(0, 2);
         }
 
+        if (exampleTranslations.length === 0) {
+          exampleTranslations = [meaning, meaning];
+        } else if (exampleTranslations.length === 1) {
+          exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
+        } else {
+          exampleTranslations = exampleTranslations.slice(0, 2);
+        }
+
         return {
           term,
           meaning,
           wordType,
           promptType,
           safeExampleSentences,
+          exampleTranslations,
         };
       })
       .filter((item) => item.term);
