@@ -37,6 +37,7 @@ const client = new OpenAI({
 
 const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE = process.env.OPENAI_TTS_VOICE || "alloy";
+const inflightTtsJobs = new Map();
 
 /* -------------------------------------------------------------------------- */
 /*                                    Utils                                   */
@@ -455,18 +456,28 @@ const generationSchema = {
 /*                                   TTS                                      */
 /* -------------------------------------------------------------------------- */
 
-function getTtsCacheKey({ text, language, speed = 1.0, voice = "" }) {
+function getTtsCacheKey({ text, language, voice = "" }) {
   return sha256(
     JSON.stringify({
       text: sanitizeTtsText(text),
       language: normalizeLanguage(language),
-      speed: clampNumber(speed, 0.5, 2.0, 1.0),
       voice: String(voice || "").trim(),
     }),
   );
 }
 
-async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }) {
+function applyPronunciationOverrides(text, language) {
+  const cleanText = sanitizeTtsText(text);
+  const normalized = normalizeLanguage(language);
+  if (normalized === 'basque') {
+    if (cleanText.toLowerCase() === 'lo egiten') {
+      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
+    }
+  }
+  return escapeSsml(cleanText);
+}
+
+async function synthesizeAzureToFile({ text, language, outputPath }) {
   return new Promise((resolve, reject) => {
     const voiceName = azureVoiceForLanguage(language);
 
@@ -486,17 +497,13 @@ async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }
     const audioConfig = sdk.AudioConfig.fromAudioFileOutput(outputPath);
     const synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig);
 
-    const safeRate = clampNumber(speed, 0.5, 2.0, 1.0);
-    const ratePercent = Math.round((safeRate - 1) * 100);
-    const cleanText = escapeSsml(sanitizeTtsText(text));
+    const cleanText = applyPronunciationOverrides(text, language);
     const langCode = azureLangCode(language);
 
     const ssml = `
       <speak version="1.0" xml:lang="${langCode}">
         <voice name="${voiceName}">
-          <prosody rate="${ratePercent >= 0 ? "+" : ""}${ratePercent}%">
-            ${cleanText}
-          </prosody>
+          ${cleanText}
         </voice>
       </speak>
     `;
@@ -550,7 +557,6 @@ async function getOrCreateTtsFile({
 }) {
   const cleanText = sanitizeTtsText(text);
   const normalizedLanguage = normalizeLanguage(language);
-  const cleanSpeed = clampNumber(speed, 0.5, 2.0, 1.0);
 
   if (!cleanText) {
     throw new Error("Missing TTS text");
@@ -559,7 +565,6 @@ async function getOrCreateTtsFile({
   const cacheKey = getTtsCacheKey({
     text: cleanText,
     language: normalizedLanguage,
-    speed: cleanSpeed,
     voice,
   });
 
@@ -582,24 +587,50 @@ async function getOrCreateTtsFile({
     };
   }
 
+  if (inflightTtsJobs.has(cacheKey)) {
+    await inflightTtsJobs.get(cacheKey);
+    return {
+      ok: true,
+      cached: fs.existsSync(outputPath),
+      language: normalizedLanguage,
+      provider: fs.existsSync(outputPath) ? "cache" : "generated",
+      voice:
+        voice ||
+        azureVoiceForLanguage(normalizedLanguage) ||
+        openAiVoiceForLanguage(normalizedLanguage) ||
+        DEFAULT_OPENAI_VOICE,
+      text: cleanText,
+      audioUrl: makeAudioUrl(req, fileName),
+    };
+  }
+
+  const job = (async () => {
+    let providerInfo;
+    try {
+      providerInfo = await synthesizeAzureToFile({
+        text: cleanText,
+        language: normalizedLanguage,
+        outputPath,
+      });
+    } catch (azureError) {
+      console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
+      providerInfo = await synthesizeOpenAIToFile({
+        text: cleanText,
+        outputPath,
+        voice,
+        language: normalizedLanguage,
+      });
+    }
+    return providerInfo;
+  })();
+
+  inflightTtsJobs.set(cacheKey, job);
+
   let providerInfo;
-
   try {
-    providerInfo = await synthesizeAzureToFile({
-      text: cleanText,
-      language: normalizedLanguage,
-      outputPath,
-      speed: cleanSpeed,
-    });
-  } catch (azureError) {
-    console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
-
-    providerInfo = await synthesizeOpenAIToFile({
-      text: cleanText,
-      outputPath,
-      voice,
-      language: normalizedLanguage,
-    });
+    providerInfo = await job;
+  } finally {
+    inflightTtsJobs.delete(cacheKey);
   }
 
   return {
@@ -988,7 +1019,6 @@ app.post("/tts", async (req, res) => {
       req,
       text,
       language,
-      speed,
       voice,
     });
 
@@ -1086,24 +1116,21 @@ app.post("/buildSessionAudio", async (req, res) => {
       req,
       text: promptText,
       language: promptAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     const targetAudio = await getOrCreateTtsFile({
       req,
       text: targetAudioText,
       language: targetAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     const revealAudio = await getOrCreateTtsFile({
       req,
       text: revealText,
       language: revealAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     let exampleAudio = null;
@@ -1113,8 +1140,7 @@ app.post("/buildSessionAudio", async (req, res) => {
         req,
         text: cleanExampleSentence,
         language: targetLanguage,
-        speed: cleanSpeed,
-        voice,
+            voice,
       });
     }
 
@@ -1303,7 +1329,6 @@ app.post("/precacheSessionAudio", async (req, res) => {
           req,
           text: exampleSentence,
           language: targetLanguage,
-          speed,
           voice,
         });
       }
