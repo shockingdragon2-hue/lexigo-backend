@@ -411,7 +411,7 @@ function promptTextForSupportLanguage(key, supportLanguage, variables = {}) {
 
   const map = {
     english: {
-      listenThinkMeaning: "Listen and think about the meaning.",
+      listenThinkMeaning: "What do you think this means?",
       whatDoesThisMean: "What does this mean?",
       howDoYouSayThisIn: `How do you say this in ${targetLanguage}?`,
       tryTranslateSentence: "Try to translate this sentence.",
@@ -445,6 +445,54 @@ function promptTextForSupportLanguage(key, supportLanguage, variables = {}) {
       answerIs: `Erantzuna ${term} da.`,
       meansIs: `${term} hitzak ${meaning} esan nahi du.`,
       xInTargetIsY: `${meaning}, ${targetLanguage} hizkuntzan, ${term} da.`,
+    },
+    portuguese: {
+      listenThinkMeaning: "O que você acha que isso significa?",
+      whatDoesThisMean: "O que isso significa?",
+      howDoYouSayThisIn: `Como se diz isso em ${targetLanguage}?`,
+      tryTranslateSentence: "Tente traduzir esta frase.",
+      sayMeaningOutLoud: "Diga em voz alta o que isso significa.",
+      sayWordOutLoud: `Como se diz isso em ${targetLanguage}? Diga em voz alta.`,
+      sayMissingWordOutLoud: `Escute e depois diga em voz alta a palavra que falta em ${targetLanguage}.`,
+      answerIs: `A resposta é ${term}.`,
+      meansIs: `${term} significa ${meaning}.`,
+      xInTargetIsY: `${meaning} em ${targetLanguage} é ${term}.`,
+    },
+    french: {
+      listenThinkMeaning: "Qu'est-ce que tu penses que cela veut dire ?",
+      whatDoesThisMean: "Qu'est-ce que cela veut dire ?",
+      howDoYouSayThisIn: `Comment dit-on cela en ${targetLanguage} ?`,
+      tryTranslateSentence: "Essaie de traduire cette phrase.",
+      sayMeaningOutLoud: "Dis à voix haute ce que cela veut dire.",
+      sayWordOutLoud: `Comment dit-on cela en ${targetLanguage} ? Dis-le à voix haute.`,
+      sayMissingWordOutLoud: `Écoute puis dis à voix haute le mot manquant en ${targetLanguage}.`,
+      answerIs: `La réponse est ${term}.`,
+      meansIs: `${term} veut dire ${meaning}.`,
+      xInTargetIsY: `${meaning} en ${targetLanguage}, c'est ${term}.`,
+    },
+    german: {
+      listenThinkMeaning: "Was glaubst du, was das bedeutet?",
+      whatDoesThisMean: "Was bedeutet das?",
+      howDoYouSayThisIn: `Wie sagt man das auf ${targetLanguage}?`,
+      tryTranslateSentence: "Versuche, diesen Satz zu übersetzen.",
+      sayMeaningOutLoud: "Sag laut, was das bedeutet.",
+      sayWordOutLoud: `Wie sagt man das auf ${targetLanguage}? Sag es laut.`,
+      sayMissingWordOutLoud: `Hör zu und sag dann das fehlende ${targetLanguage}-Wort laut.`,
+      answerIs: `Die Antwort ist ${term}.`,
+      meansIs: `${term} bedeutet ${meaning}.`,
+      xInTargetIsY: `${meaning} auf ${targetLanguage} ist ${term}.`,
+    },
+    italian: {
+      listenThinkMeaning: "Che cosa pensi che significhi?",
+      whatDoesThisMean: "Che cosa significa?",
+      howDoYouSayThisIn: `Come si dice questo in ${targetLanguage}?`,
+      tryTranslateSentence: "Prova a tradurre questa frase.",
+      sayMeaningOutLoud: "Di' ad alta voce che cosa significa.",
+      sayWordOutLoud: `Come si dice questo in ${targetLanguage}? Dillo ad alta voce.`,
+      sayMissingWordOutLoud: `Ascolta e poi di' ad alta voce la parola ${targetLanguage} che manca.`,
+      answerIs: `La risposta è ${term}.`,
+      meansIs: `${term} significa ${meaning}.`,
+      xInTargetIsY: `${meaning} in ${targetLanguage} è ${term}.`,
     },
   };
 
@@ -1055,7 +1103,11 @@ function buildRevealText({
       return cleanTerm;
     case "recall":
     default:
-      return cleanMeaning;
+      return promptTextForSupportLanguage("meansIs", baseLanguage, {
+        targetLanguage: cleanTarget,
+        term: cleanTerm,
+        meaning: cleanMeaning,
+      });
   }
 }
 
