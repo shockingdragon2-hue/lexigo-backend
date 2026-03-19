@@ -1136,6 +1136,7 @@ app.post("/tts", async (req, res) => {
       req,
       text,
       language,
+      speed,
       voice,
     });
 
@@ -1144,6 +1145,7 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       language: result.language,
       audioUrl: result.audioUrl,
+      speed,
     });
 
     res.json({
@@ -1154,6 +1156,7 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       textLength: result.text.length,
       audioUrl: result.audioUrl,
+      speed: clampNumber(speed, 0.5, 2.0, 1.0),
     });
   } catch (error) {
     console.error("tts error:", error);
@@ -1233,21 +1236,24 @@ app.post("/buildSessionAudio", async (req, res) => {
       req,
       text: promptText,
       language: promptAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     const targetAudio = await getOrCreateTtsFile({
       req,
       text: targetAudioText,
       language: targetAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     const revealAudio = await getOrCreateTtsFile({
       req,
       text: revealText,
       language: revealAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     let exampleAudio = null;
@@ -1257,7 +1263,8 @@ app.post("/buildSessionAudio", async (req, res) => {
         req,
         text: cleanExampleSentence,
         language: targetLanguage,
-            voice,
+        speed: cleanSpeed,
+        voice,
       });
     }
 
@@ -1353,6 +1360,7 @@ app.post('/ttsBatch', async (req, res) => {
   try {
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const voice = String(req.body?.voice || '').trim();
+    const speed = clampNumber(req.body?.speed, 0.5, 2.0, 1.0);
 
     if (lines.length === 0) {
       return res.status(400).json({ error: 'lines[] is required' });
@@ -1372,6 +1380,7 @@ app.post('/ttsBatch', async (req, res) => {
           req,
           text: line.text,
           language: line.language,
+          speed,
           voice,
         });
         return {
@@ -1386,6 +1395,7 @@ app.post('/ttsBatch', async (req, res) => {
     res.json({
       ok: true,
       count: results.length,
+      speed,
       items: results,
     });
   } catch (error) {
