@@ -91,6 +91,119 @@ function escapeSsml(text) {
     .replace(/>/g, "&gt;");
 }
 
+
+function normalizeMeaningForLookup(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function basqueNumberForMeaning(meaning) {
+  const normalized = normalizeMeaningForLookup(meaning);
+  const map = {
+    "0": "zero",
+    "zero": "zero",
+    "cero": "zero",
+    "1": "bat",
+    "one": "bat",
+    "uno": "bat",
+    "una": "bat",
+    "2": "bi",
+    "two": "bi",
+    "dos": "bi",
+    "3": "hiru",
+    "three": "hiru",
+    "tres": "hiru",
+    "4": "lau",
+    "four": "lau",
+    "cuatro": "lau",
+    "5": "bost",
+    "five": "bost",
+    "cinco": "bost",
+    "6": "sei",
+    "six": "sei",
+    "seis": "sei",
+    "7": "zazpi",
+    "seven": "zazpi",
+    "siete": "zazpi",
+    "8": "zortzi",
+    "eight": "zortzi",
+    "ocho": "zortzi",
+    "9": "bederatzi",
+    "nine": "bederatzi",
+    "nueve": "bederatzi",
+    "10": "hamar",
+    "ten": "hamar",
+    "diez": "hamar",
+    "11": "hamaika",
+    "eleven": "hamaika",
+    "once": "hamaika",
+    "12": "hamabi",
+    "twelve": "hamabi",
+    "doce": "hamabi",
+    "13": "hamahiru",
+    "thirteen": "hamahiru",
+    "trece": "hamahiru",
+    "14": "hamalau",
+    "fourteen": "hamalau",
+    "catorce": "hamalau",
+    "15": "hamabost",
+    "fifteen": "hamabost",
+    "quince": "hamabost",
+    "16": "hamasei",
+    "sixteen": "hamasei",
+    "dieciseis": "hamasei",
+    "dieciséis": "hamasei",
+    "17": "hamazazpi",
+    "seventeen": "hamazazpi",
+    "diecisiete": "hamazazpi",
+    "18": "hemezortzi",
+    "eighteen": "hemezortzi",
+    "dieciocho": "hemezortzi",
+    "19": "hemeretzi",
+    "nineteen": "hemeretzi",
+    "diecinueve": "hemeretzi",
+    "20": "hogei",
+    "twenty": "hogei",
+    "veinte": "hogei",
+  };
+  return map[normalized] || null;
+}
+
+function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
+  const normalizedTarget = normalizeLanguage(targetLanguage);
+  if (!Array.isArray(items) || items.length === 0) return [];
+
+  return items.map((item) => {
+    const next = {
+      ...item,
+      term: sanitizeShortLabel(item.term || "", 250),
+      meaning: sanitizeShortLabel(item.meaning || "", 250),
+      safeExampleSentences: Array.isArray(item.safeExampleSentences)
+        ? item.safeExampleSentences.map((s) => sanitizeText(s, 250))
+        : [],
+      exampleTranslations: Array.isArray(item.exampleTranslations)
+        ? item.exampleTranslations.map((s) => sanitizeText(s, 250))
+        : [],
+    };
+
+    if (normalizedTarget === "basque") {
+      const correctedNumber = basqueNumberForMeaning(next.meaning);
+      if (correctedNumber) {
+        next.term = correctedNumber;
+      }
+
+      if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
+        next.term = "hemeretzi";
+      }
+    }
+
+    return next;
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              Language Handling                             */
 /* -------------------------------------------------------------------------- */
@@ -944,48 +1057,52 @@ app.post("/generateSet", async (req, res) => {
 
     const parsed = safeJsonParse(response.output_text, { items: [] });
 
-    const items = (parsed.items || [])
-      .slice(0, cleanDesiredCount)
-      .map((item) => {
-        const term = String(item.term ?? "").trim();
-        const meaning = String(item.meaning ?? "").trim();
-        const wordType = String(item.guessedWordType ?? "other").trim();
-        const promptType = String(item.promptFamily ?? "recall").trim();
+    const items = applyKnownTermCorrections({
+      targetLanguage,
+      baseLanguage,
+      items: (parsed.items || [])
+        .slice(0, cleanDesiredCount)
+        .map((item) => {
+          const term = String(item.term ?? "").trim();
+          const meaning = String(item.meaning ?? "").trim();
+          const wordType = String(item.guessedWordType ?? "other").trim();
+          const promptType = String(item.promptFamily ?? "recall").trim();
 
-        let safeExampleSentences = Array.isArray(item.safeExampleSentences)
-          ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
-          : [];
+          let safeExampleSentences = Array.isArray(item.safeExampleSentences)
+            ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
+            : [];
 
-        let exampleTranslations = Array.isArray(item.exampleTranslations)
-          ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
-          : [];
+          let exampleTranslations = Array.isArray(item.exampleTranslations)
+            ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
+            : [];
 
-        if (safeExampleSentences.length === 0) {
-          safeExampleSentences = [term, term];
-        } else if (safeExampleSentences.length === 1) {
-          safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
-        } else {
-          safeExampleSentences = safeExampleSentences.slice(0, 2);
-        }
+          if (safeExampleSentences.length === 0) {
+            safeExampleSentences = [term, term];
+          } else if (safeExampleSentences.length === 1) {
+            safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
+          } else {
+            safeExampleSentences = safeExampleSentences.slice(0, 2);
+          }
 
-        if (exampleTranslations.length === 0) {
-          exampleTranslations = [meaning, meaning];
-        } else if (exampleTranslations.length === 1) {
-          exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
-        } else {
-          exampleTranslations = exampleTranslations.slice(0, 2);
-        }
+          if (exampleTranslations.length === 0) {
+            exampleTranslations = [meaning, meaning];
+          } else if (exampleTranslations.length === 1) {
+            exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
+          } else {
+            exampleTranslations = exampleTranslations.slice(0, 2);
+          }
 
-        return {
-          term,
-          meaning,
-          wordType,
-          promptType,
-          safeExampleSentences,
-          exampleTranslations,
-        };
-      })
-      .filter((item) => item.term);
+          return {
+            term,
+            meaning,
+            wordType,
+            promptType,
+            safeExampleSentences,
+            exampleTranslations,
+          };
+        })
+        .filter((item) => item.term),
+    });
 
     res.json({
       ok: true,
