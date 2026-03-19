@@ -37,6 +37,28 @@ const client = new OpenAI({
 
 const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE = process.env.OPENAI_TTS_VOICE || "alloy";
+const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
+const ELEVENLABS_OUTPUT_FORMAT = process.env.ELEVENLABS_OUTPUT_FORMAT || "mp3_44100_128";
+const ELEVENLABS_VOICE_STABILITY = clampNumber(
+  process.env.ELEVENLABS_VOICE_STABILITY,
+  0,
+  1,
+  0.45,
+);
+const ELEVENLABS_VOICE_SIMILARITY = clampNumber(
+  process.env.ELEVENLABS_VOICE_SIMILARITY,
+  0,
+  1,
+  0.8,
+);
+const ELEVENLABS_VOICE_STYLE = clampNumber(
+  process.env.ELEVENLABS_VOICE_STYLE,
+  0,
+  1,
+  0.15,
+);
+const ELEVENLABS_SPEAKER_BOOST =
+  String(process.env.ELEVENLABS_SPEAKER_BOOST || "true").trim().toLowerCase() !== "false";
 const inflightTtsJobs = new Map();
 
 /* -------------------------------------------------------------------------- */
@@ -293,6 +315,77 @@ function openAiVoiceForLanguage(language) {
 
 function isAzureConfigured() {
   return Boolean(process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION);
+}
+
+function isElevenLabsConfigured() {
+  return Boolean(process.env.ELEVENLABS_API_KEY);
+}
+
+function elevenLabsLanguageCode(language) {
+  const normalized = normalizeLanguage(language);
+
+  switch (normalized) {
+    case "english":
+      return "en";
+    case "spanish":
+      return "es";
+    case "portuguese":
+      return "pt";
+    case "french":
+      return "fr";
+    case "german":
+      return "de";
+    case "italian":
+      return "it";
+    default:
+      return null;
+  }
+}
+
+function elevenLabsVoiceForLanguage(language, explicitVoice = "") {
+  const normalized = normalizeLanguage(language);
+  const cleanExplicit = String(explicitVoice || "").trim();
+
+  if (cleanExplicit) {
+    return cleanExplicit;
+  }
+
+  const byLanguage = {
+    english:
+      process.env.ELEVENLABS_ENGLISH_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+    spanish:
+      process.env.ELEVENLABS_SPANISH_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+    portuguese:
+      process.env.ELEVENLABS_PORTUGUESE_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+    french:
+      process.env.ELEVENLABS_FRENCH_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+    german:
+      process.env.ELEVENLABS_GERMAN_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+    italian:
+      process.env.ELEVENLABS_ITALIAN_VOICE_ID ||
+      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
+      "",
+  };
+
+  return String(byLanguage[normalized] || process.env.ELEVENLABS_DEFAULT_VOICE_ID || "").trim();
+}
+
+function shouldUseElevenLabs(language, voice = "") {
+  return Boolean(
+    isElevenLabsConfigured() &&
+      elevenLabsLanguageCode(language) &&
+      elevenLabsVoiceForLanguage(language, voice),
+  );
 }
 
 function getBaseUrl(req) {
@@ -590,6 +683,68 @@ function applyPronunciationOverrides(text, language) {
   return escapeSsml(cleanText);
 }
 
+async function synthesizeElevenLabsToFile({
+  text,
+  language,
+  outputPath,
+  voice = "",
+}) {
+  const cleanText = sanitizeTtsText(text);
+  const languageCode = elevenLabsLanguageCode(language);
+  const voiceId = elevenLabsVoiceForLanguage(language, voice);
+
+  if (!isElevenLabsConfigured()) {
+    throw new Error("ElevenLabs API key is not configured");
+  }
+
+  if (!languageCode) {
+    throw new Error(`ElevenLabs is not enabled for language: ${normalizeLanguage(language)}`);
+  }
+
+  if (!voiceId) {
+    throw new Error(`No ElevenLabs voice configured for language: ${normalizeLanguage(language)}`);
+  }
+
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
+      voiceId,
+    )}?output_format=${encodeURIComponent(ELEVENLABS_OUTPUT_FORMAT)}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text: cleanText,
+        model_id: ELEVENLABS_MODEL_ID,
+        language_code: languageCode,
+        voice_settings: {
+          stability: ELEVENLABS_VOICE_STABILITY,
+          similarity_boost: ELEVENLABS_VOICE_SIMILARITY,
+          style: ELEVENLABS_VOICE_STYLE,
+          use_speaker_boost: ELEVENLABS_SPEAKER_BOOST,
+        },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`ElevenLabs TTS failed (${response.status}): ${errorText}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  fs.writeFileSync(outputPath, Buffer.from(arrayBuffer));
+
+  return {
+    ok: true,
+    provider: "elevenlabs",
+    voice: voiceId,
+  };
+}
+
 async function synthesizeAzureToFile({ text, language, outputPath }) {
   return new Promise((resolve, reject) => {
     const voiceName = azureVoiceForLanguage(language);
@@ -719,6 +874,21 @@ async function getOrCreateTtsFile({
 
   const job = (async () => {
     let providerInfo;
+
+    if (shouldUseElevenLabs(normalizedLanguage, voice)) {
+      try {
+        providerInfo = await synthesizeElevenLabsToFile({
+          text: cleanText,
+          language: normalizedLanguage,
+          outputPath,
+          voice,
+        });
+        return providerInfo;
+      } catch (elevenError) {
+        console.warn("ElevenLabs TTS failed, falling back:", elevenError.message);
+      }
+    }
+
     try {
       providerInfo = await synthesizeAzureToFile({
         text: cleanText,
@@ -960,6 +1130,7 @@ app.get("/", (req, res) => {
     ok: true,
     message: "AI engine connected",
     azureConfigured: isAzureConfigured(),
+    elevenLabsConfigured: isElevenLabsConfigured(),
     audioBaseUrl: `${req.protocol}://${req.get("host")}/audio/`,
   });
 });
@@ -968,6 +1139,7 @@ app.get("/health", (req, res) => {
     ok: true,
     uptime: process.uptime(),
     azureConfigured: isAzureConfigured(),
+    elevenLabsConfigured: isElevenLabsConfigured(),
   });
 });
 app.post("/generateSet", async (req, res) => {
@@ -1136,7 +1308,6 @@ app.post("/tts", async (req, res) => {
       req,
       text,
       language,
-      speed,
       voice,
     });
 
@@ -1145,7 +1316,6 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       language: result.language,
       audioUrl: result.audioUrl,
-      speed,
     });
 
     res.json({
@@ -1156,7 +1326,6 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       textLength: result.text.length,
       audioUrl: result.audioUrl,
-      speed: clampNumber(speed, 0.5, 2.0, 1.0),
     });
   } catch (error) {
     console.error("tts error:", error);
@@ -1236,24 +1405,21 @@ app.post("/buildSessionAudio", async (req, res) => {
       req,
       text: promptText,
       language: promptAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     const targetAudio = await getOrCreateTtsFile({
       req,
       text: targetAudioText,
       language: targetAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     const revealAudio = await getOrCreateTtsFile({
       req,
       text: revealText,
       language: revealAudioLanguage,
-      speed: cleanSpeed,
-      voice,
+        voice,
     });
 
     let exampleAudio = null;
@@ -1263,8 +1429,7 @@ app.post("/buildSessionAudio", async (req, res) => {
         req,
         text: cleanExampleSentence,
         language: targetLanguage,
-        speed: cleanSpeed,
-        voice,
+            voice,
       });
     }
 
@@ -1360,7 +1525,6 @@ app.post('/ttsBatch', async (req, res) => {
   try {
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const voice = String(req.body?.voice || '').trim();
-    const speed = clampNumber(req.body?.speed, 0.5, 2.0, 1.0);
 
     if (lines.length === 0) {
       return res.status(400).json({ error: 'lines[] is required' });
@@ -1380,7 +1544,6 @@ app.post('/ttsBatch', async (req, res) => {
           req,
           text: line.text,
           language: line.language,
-          speed,
           voice,
         });
         return {
@@ -1395,7 +1558,6 @@ app.post('/ttsBatch', async (req, res) => {
     res.json({
       ok: true,
       count: results.length,
-      speed,
       items: results,
     });
   } catch (error) {
