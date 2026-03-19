@@ -731,13 +731,86 @@ function applyPronunciationOverrides(text, language) {
   return escapeSsml(cleanText);
 }
 
+function looksLikeQuestion(text) {
+  const cleanText = sanitizeTtsText(text);
+  if (!cleanText) return false;
+  if (/[?¿]\s*$/.test(cleanText)) return true;
+
+  const lower = cleanText.toLowerCase();
+  return [
+    'what ', 'what do ', 'what does ', 'how ', 'how do ', 'how does ', 'which ',
+    'when ', 'where ', 'why ', 'who ', 'can ', 'could ', 'would ', 'should ',
+    'do ', 'does ', 'did ', 'is ', 'are ', 'am ', 'will ',
+    '¿',
+    'que ', 'qué ', 'como ', 'cómo ', 'cual ', 'cuál ', 'donde ', 'dónde ', 'por que ', 'por qué ',
+    'zer ', 'nola ', 'noiz ', 'non ',
+    'comment ', 'quand ', 'où ', 'pourquoi ', 'quel ', 'quelle ', "qu'est-ce",
+    'wie ', 'was ', 'wann ', 'wo ', 'warum ',
+    'come ', 'che cosa ', 'cosa ', 'quando ', 'dove ', 'perché ',
+    'o que ', 'como ', 'quando ', 'onde ', 'por que ', 'por quê '
+  ].some((prefix) => lower.startsWith(prefix));
+}
+
+function addNaturalMidPromptPauses(text) {
+  let next = sanitizeTtsText(text);
+  if (!next) return next;
+
+  const replacements = [
+    [/then\s+say/gi, 'then, say'],
+    [/and then\s+say/gi, 'and then, say'],
+    [/listen\s+first,?\s+then/gi, 'Listen first, then'],
+    [/listen,?\s+then/gi, 'Listen, then'],
+    [/say it out loud/gi, 'say it out loud'],
+    [/dilo en voz alta/gi, 'dilo en voz alta'],
+    [/di tu respuesta en voz alta/gi, 'di tu respuesta en voz alta'],
+    [/y luego/gi, 'y luego'],
+    [/escucha y luego/gi, 'escucha, y luego'],
+    [/entzun eta gero/gi, 'entzun, eta gero'],
+    [/ecoute et puis/gi, 'écoute, et puis'],
+    [/hör zu und dann/gi, 'hör zu, und dann'],
+    [/ascolta e poi/gi, 'ascolta, e poi'],
+  ];
+
+  for (const [pattern, replacement] of replacements) {
+    next = next.replace(pattern, replacement);
+  }
+
+  next = next.replace(/\s+,/g, ',');
+  next = next.replace(/,{2,}/g, ',');
+  next = next.replace(/\s{2,}/g, ' ').trim();
+  return next;
+}
+
+function prepareElevenLabsText(text, language) {
+  let cleanText = addNaturalMidPromptPauses(text);
+  const normalized = normalizeLanguage(language);
+
+  if (!cleanText) return cleanText;
+
+  const bareWordLike = /^[\p{L}\p{M}0-9][\p{L}\p{M}0-9'’ -]*[\p{L}\p{M}0-9]$/u.test(cleanText);
+  const tokenCount = cleanText.split(/\s+/).filter(Boolean).length;
+  const hasTerminalPunctuation = /[.!?…]$/.test(cleanText);
+
+  if (looksLikeQuestion(cleanText) && !/[?؟]$/.test(cleanText)) {
+    cleanText = `${cleanText.replace(/[.!,;:…]+$/g, '').trim()}?`;
+  } else if (!hasTerminalPunctuation && bareWordLike) {
+    if (tokenCount <= 2 || normalized === 'basque') {
+      cleanText = `${cleanText}.`;
+    }
+  } else if (!hasTerminalPunctuation && tokenCount >= 3 && !looksLikeQuestion(cleanText)) {
+    cleanText = `${cleanText}.`;
+  }
+
+  return cleanText;
+}
+
 async function synthesizeElevenLabsToFile({
   text,
   language,
   outputPath,
   voice = "",
 }) {
-  const cleanText = sanitizeTtsText(text);
+  const cleanText = prepareElevenLabsText(text, language);
   const languageCode = elevenLabsLanguageCode(language);
   const voiceId = elevenLabsVoiceForLanguage(language, voice);
 
@@ -765,7 +838,7 @@ async function synthesizeElevenLabsToFile({
         Accept: "audio/mpeg",
       },
       body: JSON.stringify({
-        text: cleanText,
+        text: providerText,
         model_id: ELEVENLABS_MODEL_ID,
         language_code: languageCode,
         voice_settings: {
@@ -873,13 +946,16 @@ async function getOrCreateTtsFile({
 }) {
   const cleanText = sanitizeTtsText(text);
   const normalizedLanguage = normalizeLanguage(language);
+  const providerText = shouldUseElevenLabs(normalizedLanguage, voice)
+    ? prepareElevenLabsText(cleanText, normalizedLanguage)
+    : cleanText;
 
   if (!cleanText) {
     throw new Error("Missing TTS text");
   }
 
   const cacheKey = getTtsCacheKey({
-    text: cleanText,
+    text: providerText,
     language: normalizedLanguage,
     voice,
   });
@@ -926,7 +1002,7 @@ async function getOrCreateTtsFile({
     if (shouldUseElevenLabs(normalizedLanguage, voice)) {
       try {
         providerInfo = await synthesizeElevenLabsToFile({
-          text: cleanText,
+          text: providerText,
           language: normalizedLanguage,
           outputPath,
           voice,
