@@ -253,7 +253,7 @@ function azureVoiceForLanguage(language) {
     case "spanish":
       return "es-ES-ElviraNeural";
     case "english":
-      return "en-US-JennyNeural";
+      return "en-US-AriaNeural";
     case "portuguese":
       return "pt-BR-FranciscaNeural";
     case "french":
@@ -708,9 +708,19 @@ const generationSchema = {
 
 function resolvedTtsRouting({ language, voice = "" }) {
   const normalizedLanguage = normalizeLanguage(language);
+  const explicitVoice = String(voice || "").trim();
+
+  if (isAzureConfigured() && azureVoiceForLanguage(normalizedLanguage)) {
+    return {
+      provider: "azure",
+      voice: azureVoiceForLanguage(normalizedLanguage),
+      language: normalizedLanguage,
+    };
+  }
+
   return {
-    provider: "azure",
-    voice: azureVoiceForLanguage(normalizedLanguage) || "en-US-JennyNeural",
+    provider: "openai",
+    voice: explicitVoice || openAiVoiceForLanguage(normalizedLanguage) || DEFAULT_OPENAI_VOICE,
     language: normalizedLanguage,
   };
 }
@@ -727,37 +737,106 @@ function getTtsCacheKey({ text, language, voice = "" }) {
   );
 }
 
-function applyPronunciationOverrides(text, language) {
-  const cleanText = sanitizeTtsText(text);
-  const normalized = normalizeLanguage(language);
-  if (normalized === "basque" && cleanText.toLowerCase() == "lo egiten") {
-    return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
-  }
-  return escapeSsml(cleanText);
+function looksLikeQuestion(text) {
+  return /\?$/.test(text) ||
+    /^(what|how|why|when|where|which|who|do|does|did|is|are|can|could|would|will|should|what's|how's|comment|pourquoi|quand|donde|dónde|como|cómo|que|qué)\b/i.test(text);
 }
 
-function prepareElevenLabsText(text, language) {
+function isLikelyPromptLine(text, language) {
+  const cleanText = sanitizeTtsText(text).toLowerCase();
+  const normalizedLanguage = normalizeLanguage(language);
+
+  if (!cleanText || normalizedLanguage !== "english") {
+    return false;
+  }
+
+  const promptStarters = [
+    "what do you think",
+    "what does this mean",
+    "how do you say",
+    "say this",
+    "try to translate",
+    "translate this sentence",
+    "listen",
+    "hear the word",
+    "say your answer",
+    "good work",
+    "nice job",
+    "you got it",
+    "alright, next one",
+  ];
+
+  return promptStarters.some((starter) => cleanText.startsWith(starter));
+}
+
+function prepareTtsText(text, language) {
   let cleanText = sanitizeTtsText(text);
   const normalizedLanguage = normalizeLanguage(language);
 
-  const isQuestionLike = /\?$/.test(cleanText) || /^(what|how|why|when|where|which|who|do|does|did|is|are|can|could|would|will|should|what's|how's)/i.test(cleanText);
-  if (isQuestionLike && !cleanText.endsWith('?')) {
-    cleanText = `${cleanText.replace(/[.!]+$/g, '')}?`;
+  if (looksLikeQuestion(cleanText) && !cleanText.endsWith("?")) {
+    cleanText = `${cleanText.replace(/[.!]+$/g, "")}?`;
   }
 
-  const isSingleWordOrShortPhrase = !/[.!?]$/.test(cleanText) && cleanText.split(/\s+/).filter(Boolean).length <= 3;
+  const isSingleWordOrShortPhrase =
+    !/[.!?]$/.test(cleanText) &&
+    cleanText.split(/\s+/).filter(Boolean).length <= 3;
+
   if (isSingleWordOrShortPhrase) {
-    cleanText = `${cleanText.replace(/[,:;]+$/g, '')}.`;
+    cleanText = `${cleanText.replace(/[,:;]+$/g, "")}.`;
   }
 
-  if (normalizedLanguage === 'english') {
+  if (normalizedLanguage === "english") {
     cleanText = cleanText
-      .replace(/^Listen to this word\.?\s*/i, 'Listen to this word, ')
-      .replace(/^Hear the word first\.?\s*/i, 'Hear the word first, ')
-      .replace(/^What do you think this means$/i, 'What do you think this means?');
+      .replace(/^Listen to this word\.?\s*/i, "Listen to this word, ")
+      .replace(/^Hear the word first\.?\s*/i, "Hear the word first, ")
+      .replace(/^What do you think this means$/i, "What do you think this means?");
   }
 
   return cleanText;
+}
+
+function applyPronunciationOverrides(text, language) {
+  const cleanText = prepareTtsText(text, language);
+  const normalized = normalizeLanguage(language);
+
+  if (normalized === "basque") {
+    if (cleanText.toLowerCase() === "lo egiten." || cleanText.toLowerCase() === "lo egiten") {
+      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
+    }
+  }
+
+  return escapeSsml(cleanText);
+}
+
+function buildAzureSsml({ text, language, voiceName }) {
+  const langCode = azureLangCode(language);
+  const normalizedLanguage = normalizeLanguage(language);
+  const content = applyPronunciationOverrides(text, language);
+  const isEnglishPrompt = normalizedLanguage === "english" && isLikelyPromptLine(text, language);
+  const questionLike = looksLikeQuestion(sanitizeTtsText(text));
+
+  if (isEnglishPrompt) {
+    const contour = questionLike ? ' pitch="+2Hz"' : "";
+    return `
+      <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
+        <voice name="${voiceName}">
+          <mstts:express-as style="friendly">
+            <prosody rate="-8%"${contour}>
+              ${content}
+            </prosody>
+          </mstts:express-as>
+        </voice>
+      </speak>
+    `;
+  }
+
+  return `
+    <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
+      <voice name="${voiceName}">
+        ${content}
+      </voice>
+    </speak>
+  `;
 }
 
 async function synthesizeElevenLabsToFile({
@@ -842,16 +921,11 @@ async function synthesizeAzureToFile({ text, language, outputPath }) {
     const audioConfig = sdk.AudioConfig.fromAudioFileOutput(outputPath);
     const synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig);
 
-    const cleanText = applyPronunciationOverrides(text, language);
-    const langCode = azureLangCode(language);
-
-    const ssml = `
-      <speak version="1.0" xml:lang="${langCode}">
-        <voice name="${voiceName}">
-          ${cleanText}
-        </voice>
-      </speak>
-    `;
+    const ssml = buildAzureSsml({
+      text,
+      language,
+      voiceName,
+    });
 
     synthesizer.speakSsmlAsync(
       ssml,
@@ -947,11 +1021,24 @@ async function getOrCreateTtsFile({
   }
 
   const job = (async () => {
-    return await synthesizeAzureToFile({
-      text: cleanText,
-      language: normalizedLanguage,
-      outputPath,
-    });
+    let providerInfo;
+
+    try {
+      providerInfo = await synthesizeAzureToFile({
+        text: cleanText,
+        language: normalizedLanguage,
+        outputPath,
+      });
+    } catch (azureError) {
+      console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
+      providerInfo = await synthesizeOpenAIToFile({
+        text: cleanText,
+        outputPath,
+        voice,
+        language: normalizedLanguage,
+      });
+    }
+    return providerInfo;
   })();
 
   inflightTtsJobs.set(cacheKey, job);
