@@ -1674,7 +1674,7 @@ app.post('/ttsBatch', async (req, res) => {
         language: String(line?.language || '').trim(),
       }))
       .filter((line) => line.text && line.language)
-      .slice(0, 80);
+      .slice(0, 160);
 
     const results = await Promise.all(
       capped.map(async (line) => {
@@ -1725,118 +1725,126 @@ app.post("/precacheSessionAudio", async (req, res) => {
     }
 
     const cappedItems = items.slice(0, 100);
+    const cleanDelay = clampNumber(answerDelaySeconds, 0, 15, 3);
     const results = [];
 
-    for (const item of cappedItems) {
-      const term = String(item.term || "").trim();
-      const meaning = String(item.meaning || "").trim();
-      const promptFamily = normalizePromptFamily(
-        item.promptType || item.promptFamily || "recall",
-      );
-      const exampleSentence =
-        Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
-          ? String(item.safeExampleSentences[0] || "").trim()
-          : String(item.exampleSentence || "").trim();
+    for (let startIndex = 0; startIndex < cappedItems.length; startIndex += 6) {
+      const chunk = cappedItems.slice(startIndex, startIndex + 6);
+      const builtChunk = await Promise.all(
+        chunk.map(async (item) => {
+          const term = String(item.term || "").trim();
+          const meaning = String(item.meaning || "").trim();
+          const promptFamily = normalizePromptFamily(
+            item.promptType || item.promptFamily || "recall",
+          );
+          const exampleSentence =
+            Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
+              ? String(item.safeExampleSentences[0] || "").trim()
+              : String(item.exampleSentence || "").trim();
 
-      const promptText = buildPromptText({
-        practiceMode,
-        promptFamily,
-        targetLanguage,
-        baseLanguage,
-        sentence: exampleSentence,
-      });
+          const promptText = buildPromptText({
+            practiceMode,
+            promptFamily,
+            targetLanguage,
+            baseLanguage,
+            sentence: exampleSentence,
+          });
 
-      const targetAudioText = buildTargetAudioText({
-        promptFamily,
-        term,
-        meaning,
-        sentence: exampleSentence,
-      });
+          const targetAudioText = buildTargetAudioText({
+            promptFamily,
+            term,
+            meaning,
+            sentence: exampleSentence,
+          });
 
-      const revealText = buildRevealText({
-        practiceMode,
-        promptFamily,
-        targetLanguage,
-        baseLanguage,
-        term,
-        meaning,
-      });
+          const revealText = buildRevealText({
+            practiceMode,
+            promptFamily,
+            targetLanguage,
+            baseLanguage,
+            term,
+            meaning,
+          });
 
-      const promptAudioLanguage = baseLanguage;
-      const targetAudioLanguage = buildTargetAudioLanguage({
-        promptFamily,
-        targetLanguage,
-        baseLanguage,
-      });
-      const revealAudioLanguage = buildRevealAudioLanguage({
-        promptFamily,
-        targetLanguage,
-        baseLanguage,
-        practiceMode,
-      });
+          const promptAudioLanguage = baseLanguage;
+          const targetAudioLanguage = buildTargetAudioLanguage({
+            promptFamily,
+            targetLanguage,
+            baseLanguage,
+          });
+          const revealAudioLanguage = buildRevealAudioLanguage({
+            promptFamily,
+            targetLanguage,
+            baseLanguage,
+            practiceMode,
+          });
 
-      const [promptAudio, targetAudio, revealAudio, exampleAudio] = await Promise.all([
-        getOrCreateTtsFile({
-          req,
-          text: promptText,
-          language: promptAudioLanguage,
-          speed,
-          voice,
-        }),
-        getOrCreateTtsFile({
-          req,
-          text: targetAudioText,
-          language: targetAudioLanguage,
-          speed,
-          voice,
-        }),
-        getOrCreateTtsFile({
-          req,
-          text: revealText,
-          language: revealAudioLanguage,
-          speed,
-          voice,
-        }),
-        includeExampleAudio && exampleSentence
-          ? getOrCreateTtsFile({
+          const [promptAudio, targetAudio, revealAudio, exampleAudio] = await Promise.all([
+            getOrCreateTtsFile({
               req,
-              text: exampleSentence,
-              language: targetLanguage,
+              text: promptText,
+              language: promptAudioLanguage,
+              speed,
               voice,
-            })
-          : Promise.resolve(null),
-      ]);
+            }),
+            getOrCreateTtsFile({
+              req,
+              text: targetAudioText,
+              language: targetAudioLanguage,
+              speed,
+              voice,
+            }),
+            getOrCreateTtsFile({
+              req,
+              text: revealText,
+              language: revealAudioLanguage,
+              speed,
+              voice,
+            }),
+            includeExampleAudio && exampleSentence
+              ? getOrCreateTtsFile({
+                  req,
+                  text: exampleSentence,
+                  language: targetLanguage,
+                  speed,
+                  voice,
+                })
+              : Promise.resolve(null),
+          ]);
 
-      results.push({
-        term,
-        meaning,
-        promptFamily,
-        answerDelaySeconds: clampNumber(answerDelaySeconds, 0, 15, 3),
-        audio: {
-          prompt: {
-            text: promptText,
-            language: normalizeLanguage(promptAudioLanguage),
-            audioUrl: promptAudio.audioUrl,
-          },
-          target: {
-            text: targetAudioText,
-            language: normalizeLanguage(targetAudioLanguage),
-            audioUrl: targetAudio.audioUrl,
-          },
-          reveal: {
-            text: revealText,
-            language: normalizeLanguage(revealAudioLanguage),
-            audioUrl: revealAudio.audioUrl,
-          },
-          example: exampleAudio
-            ? {
-                text: exampleSentence,
-                language: normalizeLanguage(targetLanguage),
-                audioUrl: exampleAudio.audioUrl,
-              }
-            : null,
-        },
-      });
+          return {
+            term,
+            meaning,
+            promptFamily,
+            answerDelaySeconds: cleanDelay,
+            audio: {
+              prompt: {
+                text: promptText,
+                language: normalizeLanguage(promptAudioLanguage),
+                audioUrl: promptAudio.audioUrl,
+              },
+              target: {
+                text: targetAudioText,
+                language: normalizeLanguage(targetAudioLanguage),
+                audioUrl: targetAudio.audioUrl,
+              },
+              reveal: {
+                text: revealText,
+                language: normalizeLanguage(revealAudioLanguage),
+                audioUrl: revealAudio.audioUrl,
+              },
+              example: exampleAudio
+                ? {
+                    text: exampleSentence,
+                    language: normalizeLanguage(targetLanguage),
+                    audioUrl: exampleAudio.audioUrl,
+                  }
+                : null,
+            },
+          };
+        }),
+      );
+      results.push(...builtChunk);
     }
 
     res.json({
