@@ -194,6 +194,50 @@ function basqueNumberForMeaning(meaning) {
   return map[normalized] || null;
 }
 
+
+function stripMeaningNoise(value) {
+  let text = sanitizeShortLabel(value || "", 250);
+  text = text
+    .replace(/^(means|significa|veut dire|bedeutet|esan nahi du)\s+/i, "")
+    .replace(/^(color|colour|colore|couleur|farbe)\s+/i, "")
+    .replace(/^(the color|el color|la couleur|die farbe)\s+/i, "")
+    .trim();
+  return text;
+}
+
+function normalizeBasqueSurfaceForm(term, meaning) {
+  const cleanTerm = sanitizeShortLabel(term || "", 250);
+  const normalizedMeaning = normalizeMeaningForLookup(stripMeaningNoise(meaning));
+  const colorMap = {
+    green: "berde",
+    verde: "berde",
+    red: "gorri",
+    rojo: "gorri",
+    blue: "urdin",
+    azul: "urdin",
+    yellow: "hori",
+    amarillo: "hori",
+    black: "beltz",
+    negro: "beltz",
+    white: "zuri",
+    blanco: "zuri",
+    orange: "laranja",
+    naranja: "laranja",
+    purple: "more",
+    morado: "more",
+    brown: "marroi",
+    marron: "marroi",
+    marrón: "marroi",
+    gray: "gris",
+    grey: "gris",
+    gris: "gris",
+  };
+  if (colorMap[normalizedMeaning]) {
+    return colorMap[normalizedMeaning];
+  }
+  return cleanTerm;
+}
+
 function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
   const normalizedTarget = normalizeLanguage(targetLanguage);
   if (!Array.isArray(items) || items.length === 0) return [];
@@ -202,7 +246,7 @@ function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
     const next = {
       ...item,
       term: sanitizeShortLabel(item.term || "", 250),
-      meaning: sanitizeShortLabel(item.meaning || "", 250),
+      meaning: stripMeaningNoise(item.meaning || ""),
       safeExampleSentences: Array.isArray(item.safeExampleSentences)
         ? item.safeExampleSentences.map((s) => sanitizeText(s, 250))
         : [],
@@ -216,6 +260,8 @@ function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
       if (correctedNumber) {
         next.term = correctedNumber;
       }
+
+      next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
 
       if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
         next.term = "hemeretzi";
@@ -582,6 +628,8 @@ General requirements:
 - Avoid explicit, unsafe, political, hateful, scary, medical, or disturbing content.
 - Prefer words and phrases useful in daily life.
 - Meanings should be concise and easy to understand in the base language.
+- Meanings must be the plain translation only, not a full sentence and not something like 'means green' or 'color green'.
+- Terms must be the clean dictionary-style target-language form only.
 - Each item must include:
   - term
   - meaning
@@ -725,7 +773,7 @@ function resolvedTtsRouting({ language, voice = "" }) {
   };
 }
 
-function getTtsCacheKey({ text, language, voice = "" }) {
+function getTtsCacheKey({ text, language, voice = "", speed = 1.0 }) {
   const route = resolvedTtsRouting({ language, voice });
   return sha256(
     JSON.stringify({
@@ -733,6 +781,7 @@ function getTtsCacheKey({ text, language, voice = "" }) {
       language: route.language,
       provider: route.provider,
       voice: route.voice,
+      speed: Number(speed || 1).toFixed(2),
     }),
   );
 }
@@ -808,12 +857,16 @@ function applyPronunciationOverrides(text, language) {
   return escapeSsml(cleanText);
 }
 
-function buildAzureSsml({ text, language, voiceName }) {
+function buildAzureSsml({ text, language, voiceName, speed = 1.0 }) {
   const langCode = azureLangCode(language);
   const normalizedLanguage = normalizeLanguage(language);
   const content = applyPronunciationOverrides(text, language);
   const isEnglishPrompt = normalizedLanguage === "english" && isLikelyPromptLine(text, language);
   const questionLike = looksLikeQuestion(sanitizeTtsText(text));
+
+  const normalizedSpeed = clampNumber(speed, 0.7, 1.35, 1.0);
+  const ratePercent = Math.round((normalizedSpeed - 1) * 100);
+  const rate = ratePercent >= 0 ? `+${ratePercent}%` : `${ratePercent}%`;
 
   if (isEnglishPrompt) {
     const contour = questionLike ? ' pitch="+2Hz"' : "";
@@ -821,7 +874,7 @@ function buildAzureSsml({ text, language, voiceName }) {
       <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
         <voice name="${voiceName}">
           <mstts:express-as style="friendly">
-            <prosody rate="-8%"${contour}>
+            <prosody rate="${rate}"${contour}>
               ${content}
             </prosody>
           </mstts:express-as>
@@ -833,7 +886,9 @@ function buildAzureSsml({ text, language, voiceName }) {
   return `
     <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
       <voice name="${voiceName}">
-        ${content}
+        <prosody rate="${rate}">
+          ${content}
+        </prosody>
       </voice>
     </speak>
   `;
@@ -901,7 +956,7 @@ async function synthesizeElevenLabsToFile({
   };
 }
 
-async function synthesizeAzureToFile({ text, language, outputPath }) {
+async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }) {
   return new Promise((resolve, reject) => {
     const voiceName = azureVoiceForLanguage(language);
 
@@ -925,6 +980,7 @@ async function synthesizeAzureToFile({ text, language, outputPath }) {
       text,
       language,
       voiceName,
+      speed,
     });
 
     synthesizer.speakSsmlAsync(
@@ -951,6 +1007,7 @@ async function synthesizeOpenAIToFile({
   outputPath,
   voice = DEFAULT_OPENAI_VOICE,
   language = "english",
+  speed = 1.0,
 }) {
   const cleanText = sanitizeTtsText(text);
   const chosenVoice = voice || openAiVoiceForLanguage(language) || DEFAULT_OPENAI_VOICE;
@@ -990,6 +1047,7 @@ async function getOrCreateTtsFile({
     text: cleanText,
     language: normalizedLanguage,
     voice,
+    speed,
   });
 
   const fileName = `${cacheKey}.mp3`;
@@ -1028,6 +1086,7 @@ async function getOrCreateTtsFile({
         text: cleanText,
         language: normalizedLanguage,
         outputPath,
+        speed,
       });
     } catch (azureError) {
       console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
@@ -1036,6 +1095,7 @@ async function getOrCreateTtsFile({
         outputPath,
         voice,
         language: normalizedLanguage,
+        speed,
       });
     }
     return providerInfo;
@@ -1446,6 +1506,7 @@ app.post("/tts", async (req, res) => {
       req,
       text,
       language,
+      speed,
       voice,
     });
 
@@ -1663,6 +1724,7 @@ app.post('/ttsBatch', async (req, res) => {
   try {
     const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const voice = String(req.body?.voice || '').trim();
+    const speed = clampNumber(req.body?.speed, 0.7, 1.35, 1.0);
 
     if (lines.length === 0) {
       return res.status(400).json({ error: 'lines[] is required' });
@@ -1683,6 +1745,7 @@ app.post('/ttsBatch', async (req, res) => {
           text: line.text,
           language: line.language,
           voice,
+          speed,
         });
         return {
           key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
