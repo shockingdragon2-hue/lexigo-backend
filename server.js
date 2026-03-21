@@ -89,6 +89,10 @@ const ELEVENLABS_VOICE_STYLE = clampNumber(
 const ELEVENLABS_SPEAKER_BOOST =
   String(process.env.ELEVENLABS_SPEAKER_BOOST || "true").trim().toLowerCase() !== "false";
 const inflightTtsJobs = new Map();
+const TTS_JOB_TIMEOUT_MS = clampNumber(process.env.TTS_JOB_TIMEOUT_MS, 3000, 30000, 12000);
+const TTS_BATCH_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_BATCH_CONCURRENCY, 1, 12, 4)));
+const TTS_PRECACHED_ITEM_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_PRECACHED_ITEM_CONCURRENCY, 1, 12, 3)));
+const TTS_AUDIO_PART_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_AUDIO_PART_CONCURRENCY, 1, 6, 3)));
 
 /* -------------------------------------------------------------------------- */
 /*                                    Utils                                   */
@@ -113,6 +117,60 @@ function clampNumber(value, min, max, fallback) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, label = "operation") {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) return [];
+
+  const results = new Array(list.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= list.length) return;
+      results[current] = await mapper(list[current], current);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(concurrency, list.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
+async function settleWithConcurrency(items, concurrency, mapper) {
+  return mapWithConcurrency(items, concurrency, async (item, index) => {
+    try {
+      const value = await mapper(item, index);
+      return { status: "fulfilled", value };
+    } catch (error) {
+      return {
+        status: "rejected",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
 }
 
 function makeTempAudioPath(outputPath) {
@@ -1169,7 +1227,7 @@ async function getOrCreateTtsFile({
   }
 
   if (inflightTtsJobs.has(cacheKey)) {
-    await inflightTtsJobs.get(cacheKey);
+    await withTimeout(inflightTtsJobs.get(cacheKey), TTS_JOB_TIMEOUT_MS, `Waiting for inflight TTS job (${cacheKey.slice(0, 8)})`);
     const ready = await waitForFileReady(outputPath, {
       minBytes: MIN_AUDIO_FILE_BYTES,
       attempts: 8,
@@ -1193,7 +1251,7 @@ async function getOrCreateTtsFile({
     };
   }
 
-  const job = (async () => {
+  const job = withTimeout((async () => {
     let providerInfo;
 
     try {
@@ -1214,7 +1272,7 @@ async function getOrCreateTtsFile({
       });
     }
     return providerInfo;
-  })();
+  })(), TTS_JOB_TIMEOUT_MS, `TTS generation (${route.provider}:${route.voice})`);
 
   inflightTtsJobs.set(cacheKey, job);
 
@@ -1458,6 +1516,8 @@ app.get("/", (req, res) => {
     azureConfigured: isAzureConfigured(),
     elevenLabsConfigured: isElevenLabsConfigured(),
     audioBaseUrl: `${req.protocol}://${req.get("host")}/audio/`,
+    ttsJobTimeoutMs: TTS_JOB_TIMEOUT_MS,
+    ttsBatchConcurrency: TTS_BATCH_CONCURRENCY,
   });
 });
 app.get("/health", (req, res) => {
@@ -1466,6 +1526,10 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     azureConfigured: isAzureConfigured(),
     elevenLabsConfigured: isElevenLabsConfigured(),
+    ttsJobTimeoutMs: TTS_JOB_TIMEOUT_MS,
+    ttsBatchConcurrency: TTS_BATCH_CONCURRENCY,
+    ttsPrecacheItemConcurrency: TTS_PRECACHED_ITEM_CONCURRENCY,
+    ttsAudioPartConcurrency: TTS_AUDIO_PART_CONCURRENCY,
   });
 });
 app.post("/generateSet", async (req, res) => {
@@ -1733,41 +1797,80 @@ app.post("/buildSessionAudio", async (req, res) => {
       practiceMode: cleanPracticeMode,
     });
 
-    const promptAudio = await getOrCreateTtsFile({
-      req,
-      text: promptText,
-      language: promptAudioLanguage,
-      speed: cleanSpeed,
-      voice,
-    });
+    const audioTasks = [
+      {
+        key: "prompt",
+        required: true,
+        run: () =>
+          getOrCreateTtsFile({
+            req,
+            text: promptText,
+            language: promptAudioLanguage,
+            speed: cleanSpeed,
+            voice,
+          }),
+      },
+      {
+        key: "target",
+        required: true,
+        run: () =>
+          getOrCreateTtsFile({
+            req,
+            text: targetAudioText,
+            language: targetAudioLanguage,
+            speed: cleanSpeed,
+            voice,
+          }),
+      },
+      {
+        key: "reveal",
+        required: true,
+        run: () =>
+          getOrCreateTtsFile({
+            req,
+            text: revealText,
+            language: revealAudioLanguage,
+            speed: cleanSpeed,
+            voice,
+          }),
+      },
+      ...(includeExampleAudio && cleanExampleSentence
+        ? [{
+            key: "example",
+            required: false,
+            run: () =>
+              getOrCreateTtsFile({
+                req,
+                text: cleanExampleSentence,
+                language: targetLanguage,
+                speed: cleanSpeed,
+                voice,
+              }),
+          }]
+        : []),
+    ];
 
-    const targetAudio = await getOrCreateTtsFile({
-      req,
-      text: targetAudioText,
-      language: targetAudioLanguage,
-      speed: cleanSpeed,
-      voice,
-    });
+    const settledAudioTasks = await settleWithConcurrency(
+      audioTasks,
+      TTS_AUDIO_PART_CONCURRENCY,
+      async (task) => withTimeout(task.run(), TTS_JOB_TIMEOUT_MS, `buildSessionAudio:${task.key}`),
+    );
 
-    const revealAudio = await getOrCreateTtsFile({
-      req,
-      text: revealText,
-      language: revealAudioLanguage,
-      speed: cleanSpeed,
-      voice,
-    });
+    const audioMap = Object.fromEntries(
+      settledAudioTasks.map((result, index) => [audioTasks[index].key, result]),
+    );
 
-    let exampleAudio = null;
-
-    if (includeExampleAudio && cleanExampleSentence) {
-      exampleAudio = await getOrCreateTtsFile({
-        req,
-        text: cleanExampleSentence,
-        language: targetLanguage,
-        speed: cleanSpeed,
-        voice,
-      });
+    for (const task of audioTasks) {
+      const result = audioMap[task.key];
+      if (task.required && result?.status !== "fulfilled") {
+        throw new Error(`Failed to prepare ${task.key} audio: ${result?.reason || "unknown error"}`);
+      }
     }
+
+    const promptAudio = audioMap.prompt.value;
+    const targetAudio = audioMap.target.value;
+    const revealAudio = audioMap.reveal.value;
+    const exampleAudio = audioMap.example?.status === "fulfilled" ? audioMap.example.value : null;
 
     const sequence = [
       {
@@ -1875,28 +1978,45 @@ app.post('/ttsBatch', async (req, res) => {
       .filter((line) => line.text && line.language)
       .slice(0, 160);
 
-    const results = await Promise.all(
-      capped.map(async (line) => {
-        const audio = await getOrCreateTtsFile({
+    const settled = await settleWithConcurrency(capped, TTS_BATCH_CONCURRENCY, async (line) => {
+      const audio = await withTimeout(
+        getOrCreateTtsFile({
           req,
           text: line.text,
           language: line.language,
           voice,
           speed,
-        });
-        return {
-          key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
-          audioUrl: audio.audioUrl,
-          language: normalizeLanguage(line.language),
-          text: line.text,
-        };
-      }),
-    );
+        }),
+        TTS_JOB_TIMEOUT_MS,
+        `ttsBatch:${line.language}:${line.text.slice(0, 40)}`
+      );
+      return {
+        key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
+        audioUrl: audio.audioUrl,
+        language: normalizeLanguage(line.language),
+        text: line.text,
+      };
+    });
+
+    const items = settled
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    const failures = settled
+      .map((result, index) => ({ result, line: capped[index] }))
+      .filter(({ result }) => result.status === "rejected")
+      .map(({ result, line }) => ({
+        key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
+        language: normalizeLanguage(line.language),
+        text: line.text,
+        error: result.reason,
+      }));
 
     res.json({
-      ok: true,
-      count: results.length,
-      items: results,
+      ok: failures.length === 0,
+      count: items.length,
+      failedCount: failures.length,
+      items,
+      failures,
     });
   } catch (error) {
     console.error('ttsBatch error:', error);
@@ -1926,131 +2046,183 @@ app.post("/precacheSessionAudio", async (req, res) => {
 
     const cappedItems = items.slice(0, 100);
     const cleanDelay = clampNumber(answerDelaySeconds, 0, 15, 3);
-    const results = [];
+    const cleanSpeed = clampNumber(speed, 0.5, 2.0, 1.0);
 
-    for (let startIndex = 0; startIndex < cappedItems.length; startIndex += 6) {
-      const chunk = cappedItems.slice(startIndex, startIndex + 6);
-      const builtChunk = await Promise.all(
-        chunk.map(async (item) => {
-          const term = String(item.term || "").trim();
-          const meaning = String(item.meaning || "").trim();
-          const promptFamily = normalizePromptFamily(
-            item.promptType || item.promptFamily || "recall",
-          );
-          const exampleSentence =
-            Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
-              ? String(item.safeExampleSentences[0] || "").trim()
-              : String(item.exampleSentence || "").trim();
+    const settledItems = await settleWithConcurrency(
+      cappedItems,
+      TTS_PRECACHED_ITEM_CONCURRENCY,
+      async (item) => {
+        const term = String(item.term || "").trim();
+        const meaning = String(item.meaning || "").trim();
+        const promptFamily = normalizePromptFamily(
+          item.promptType || item.promptFamily || "recall",
+        );
+        const exampleSentence =
+          Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
+            ? String(item.safeExampleSentences[0] || "").trim()
+            : String(item.exampleSentence || "").trim();
 
-          const promptText = buildPromptText({
-            practiceMode,
-            promptFamily,
-            targetLanguage,
-            baseLanguage,
-            sentence: exampleSentence,
-          });
+        const promptText = buildPromptText({
+          practiceMode,
+          promptFamily,
+          targetLanguage,
+          baseLanguage,
+          sentence: exampleSentence,
+        });
 
-          const targetAudioText = buildTargetAudioText({
-            promptFamily,
-            term,
-            meaning,
-            sentence: exampleSentence,
-          });
+        const targetAudioText = buildTargetAudioText({
+          promptFamily,
+          term,
+          meaning,
+          sentence: exampleSentence,
+        });
 
-          const revealText = buildRevealText({
-            practiceMode,
-            promptFamily,
-            targetLanguage,
-            baseLanguage,
-            term,
-            meaning,
-          });
+        const revealText = buildRevealText({
+          practiceMode,
+          promptFamily,
+          targetLanguage,
+          baseLanguage,
+          term,
+          meaning,
+        });
 
-          const promptAudioLanguage = baseLanguage;
-          const targetAudioLanguage = buildTargetAudioLanguage({
-            promptFamily,
-            targetLanguage,
-            baseLanguage,
-          });
-          const revealAudioLanguage = buildRevealAudioLanguage({
-            promptFamily,
-            targetLanguage,
-            baseLanguage,
-            practiceMode,
-          });
+        const promptAudioLanguage = baseLanguage;
+        const targetAudioLanguage = buildTargetAudioLanguage({
+          promptFamily,
+          targetLanguage,
+          baseLanguage,
+        });
+        const revealAudioLanguage = buildRevealAudioLanguage({
+          promptFamily,
+          targetLanguage,
+          baseLanguage,
+          practiceMode,
+        });
 
-          const [promptAudio, targetAudio, revealAudio, exampleAudio] = await Promise.all([
-            getOrCreateTtsFile({
-              req,
-              text: promptText,
-              language: promptAudioLanguage,
-              speed,
-              voice,
-            }),
-            getOrCreateTtsFile({
-              req,
-              text: targetAudioText,
-              language: targetAudioLanguage,
-              speed,
-              voice,
-            }),
-            getOrCreateTtsFile({
-              req,
-              text: revealText,
-              language: revealAudioLanguage,
-              speed,
-              voice,
-            }),
-            includeExampleAudio && exampleSentence
-              ? getOrCreateTtsFile({
-                  req,
-                  text: exampleSentence,
-                  language: targetLanguage,
-                  speed,
-                  voice,
-                })
-              : Promise.resolve(null),
-          ]);
-
-          return {
-            term,
-            meaning,
-            promptFamily,
-            answerDelaySeconds: cleanDelay,
-            audio: {
-              prompt: {
+        const audioTasks = [
+          {
+            key: "prompt",
+            required: true,
+            run: () =>
+              getOrCreateTtsFile({
+                req,
                 text: promptText,
-                language: normalizeLanguage(promptAudioLanguage),
-                audioUrl: promptAudio.audioUrl,
-              },
-              target: {
+                language: promptAudioLanguage,
+                speed: cleanSpeed,
+                voice,
+              }),
+          },
+          {
+            key: "target",
+            required: true,
+            run: () =>
+              getOrCreateTtsFile({
+                req,
                 text: targetAudioText,
-                language: normalizeLanguage(targetAudioLanguage),
-                audioUrl: targetAudio.audioUrl,
-              },
-              reveal: {
+                language: targetAudioLanguage,
+                speed: cleanSpeed,
+                voice,
+              }),
+          },
+          {
+            key: "reveal",
+            required: true,
+            run: () =>
+              getOrCreateTtsFile({
+                req,
                 text: revealText,
-                language: normalizeLanguage(revealAudioLanguage),
-                audioUrl: revealAudio.audioUrl,
-              },
-              example: exampleAudio
-                ? {
+                language: revealAudioLanguage,
+                speed: cleanSpeed,
+                voice,
+              }),
+          },
+          ...(includeExampleAudio && exampleSentence
+            ? [{
+                key: "example",
+                required: false,
+                run: () =>
+                  getOrCreateTtsFile({
+                    req,
                     text: exampleSentence,
-                    language: normalizeLanguage(targetLanguage),
-                    audioUrl: exampleAudio.audioUrl,
-                  }
-                : null,
+                    language: targetLanguage,
+                    speed: cleanSpeed,
+                    voice,
+                  }),
+              }]
+            : []),
+        ];
+
+        const settledAudio = await settleWithConcurrency(
+          audioTasks,
+          TTS_AUDIO_PART_CONCURRENCY,
+          async (task) => withTimeout(task.run(), TTS_JOB_TIMEOUT_MS, `precache:${task.key}:${term.slice(0, 40)}`),
+        );
+
+        const audioMap = Object.fromEntries(
+          settledAudio.map((result, index) => [audioTasks[index].key, result]),
+        );
+
+        const requiredFailure = audioTasks.find(
+          (task) => task.required && audioMap[task.key]?.status !== "fulfilled",
+        );
+
+        if (requiredFailure) {
+          throw new Error(
+            `${requiredFailure.key} audio failed for "${term || meaning || "item"}": ${audioMap[requiredFailure.key]?.reason || "unknown error"}`
+          );
+        }
+
+        return {
+          term,
+          meaning,
+          promptFamily,
+          answerDelaySeconds: cleanDelay,
+          audio: {
+            prompt: {
+              text: promptText,
+              language: normalizeLanguage(promptAudioLanguage),
+              audioUrl: audioMap.prompt.value.audioUrl,
             },
-          };
-        }),
-      );
-      results.push(...builtChunk);
-    }
+            target: {
+              text: targetAudioText,
+              language: normalizeLanguage(targetAudioLanguage),
+              audioUrl: audioMap.target.value.audioUrl,
+            },
+            reveal: {
+              text: revealText,
+              language: normalizeLanguage(revealAudioLanguage),
+              audioUrl: audioMap.reveal.value.audioUrl,
+            },
+            example: audioMap.example?.status === "fulfilled"
+              ? {
+                  text: exampleSentence,
+                  language: normalizeLanguage(targetLanguage),
+                  audioUrl: audioMap.example.value.audioUrl,
+                }
+              : null,
+          },
+        };
+      },
+    );
+
+    const results = settledItems
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    const failures = settledItems
+      .map((result, index) => ({ result, item: cappedItems[index] }))
+      .filter(({ result }) => result.status === "rejected")
+      .map(({ result, item }) => ({
+        term: String(item.term || "").trim(),
+        meaning: String(item.meaning || "").trim(),
+        error: result.reason,
+      }));
 
     res.json({
-      ok: true,
+      ok: failures.length === 0,
       count: results.length,
+      failedCount: failures.length,
       items: results,
+      failures,
     });
   } catch (error) {
     console.error("precacheSessionAudio error:", error);
