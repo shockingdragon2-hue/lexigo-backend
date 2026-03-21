@@ -16,15 +16,44 @@ app.use(express.json({ limit: "25mb" }));
 
 const ROOT_DIR = process.cwd();
 const AUDIO_DIR = path.join(ROOT_DIR, "audio");
+const TMP_AUDIO_DIR = path.join(AUDIO_DIR, ".tmp");
+const MIN_AUDIO_FILE_BYTES = 512;
 
 ensureDir(AUDIO_DIR);
-app.use(
-  "/audio",
-  express.static(AUDIO_DIR, {
-    maxAge: "30d",
-    immutable: true,
-  }),
-);
+ensureDir(TMP_AUDIO_DIR);
+
+
+app.get("/audio/:fileName", async (req, res) => {
+  try {
+    const requestedName = path.basename(String(req.params.fileName || ""));
+
+    if (!requestedName || !requestedName.endsWith(".mp3")) {
+      return res.status(400).json({ error: "Invalid audio file name" });
+    }
+
+    const filePath = path.join(AUDIO_DIR, requestedName);
+    const ready = await waitForFileReady(filePath, {
+      minBytes: MIN_AUDIO_FILE_BYTES,
+      attempts: 6,
+      delayMs: 120,
+    });
+
+    if (!ready) {
+      return res.status(404).json({ error: "Audio file not ready" });
+    }
+
+    const stat = fs.statSync(filePath);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader("Cache-Control", "public, max-age=2592000, immutable");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.sendFile(filePath);
+  } catch (error) {
+    console.error("audio route error:", error);
+    res.status(500).json({ error: "Failed to serve audio", details: error.message });
+  }
+});
 
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
@@ -79,6 +108,61 @@ function clampNumber(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
+}
+
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function makeTempAudioPath(outputPath) {
+  const tempName = `${path.basename(outputPath)}.${process.pid}.${Date.now()}.${Math.random()
+    .toString(16)
+    .slice(2)}.tmp`;
+  return path.join(TMP_AUDIO_DIR, tempName);
+}
+
+function isFileReady(filePath, minBytes = MIN_AUDIO_FILE_BYTES) {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && stat.size >= minBytes;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForFileReady(filePath, { minBytes = MIN_AUDIO_FILE_BYTES, attempts = 8, delayMs = 120 } = {}) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (isFileReady(filePath, minBytes)) {
+      return true;
+    }
+    await sleep(delayMs);
+  }
+  return false;
+}
+
+function removeFileIfExists(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    console.warn(`Failed to remove file ${filePath}:`, error.message);
+  }
+}
+
+function finalizeGeneratedAudio(tempPath, outputPath) {
+  if (!isFileReady(tempPath)) {
+    removeFileIfExists(tempPath);
+    throw new Error(`Generated audio file was empty or invalid for ${path.basename(outputPath)}`);
+  }
+
+  fs.renameSync(tempPath, outputPath);
+
+  if (!isFileReady(outputPath)) {
+    removeFileIfExists(outputPath);
+    throw new Error(`Final audio file was not ready after rename for ${path.basename(outputPath)}`);
+  }
 }
 
 function sanitizeText(text, maxLen = 4000) {
@@ -947,7 +1031,9 @@ async function synthesizeElevenLabsToFile({
   }
 
   const arrayBuffer = await response.arrayBuffer();
-  fs.writeFileSync(outputPath, Buffer.from(arrayBuffer));
+  const tempPath = makeTempAudioPath(outputPath);
+  fs.writeFileSync(tempPath, Buffer.from(arrayBuffer));
+  finalizeGeneratedAudio(tempPath, outputPath);
 
   return {
     ok: true,
@@ -958,6 +1044,7 @@ async function synthesizeElevenLabsToFile({
 
 async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }) {
   return new Promise((resolve, reject) => {
+    const tempPath = makeTempAudioPath(outputPath);
     const voiceName = azureVoiceForLanguage(language);
 
     if (!voiceName || !isAzureConfigured()) {
@@ -973,7 +1060,7 @@ async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }
     speechConfig.speechSynthesisOutputFormat =
       sdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3;
 
-    const audioConfig = sdk.AudioConfig.fromAudioFileOutput(outputPath);
+    const audioConfig = sdk.AudioConfig.fromAudioFileOutput(tempPath);
     const synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig);
 
     const ssml = buildAzureSsml({
@@ -989,13 +1076,20 @@ async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }
         synthesizer.close();
 
         if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
-          resolve({ ok: true, provider: "azure", voice: voiceName });
+          try {
+            finalizeGeneratedAudio(tempPath, outputPath);
+            resolve({ ok: true, provider: "azure", voice: voiceName });
+          } catch (fileError) {
+            reject(fileError);
+          }
         } else {
+          removeFileIfExists(tempPath);
           reject(new Error("Azure synthesis failed"));
         }
       },
       (err) => {
         synthesizer.close();
+        removeFileIfExists(tempPath);
         reject(err);
       },
     );
@@ -1019,7 +1113,9 @@ async function synthesizeOpenAIToFile({
   });
 
   const buffer = Buffer.from(await mp3.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
+  const tempPath = makeTempAudioPath(outputPath);
+  fs.writeFileSync(tempPath, buffer);
+  finalizeGeneratedAudio(tempPath, outputPath);
 
   return { ok: true, provider: "openai", voice: chosenVoice };
 }
@@ -1053,7 +1149,7 @@ async function getOrCreateTtsFile({
   const fileName = `${cacheKey}.mp3`;
   const outputPath = path.join(AUDIO_DIR, fileName);
 
-  if (fs.existsSync(outputPath)) {
+  if (isFileReady(outputPath)) {
     return {
       ok: true,
       cached: true,
@@ -1062,19 +1158,38 @@ async function getOrCreateTtsFile({
       voice: route.voice,
       text: cleanText,
       audioUrl: makeAudioUrl(req, fileName),
+      fileName,
+      filePath: outputPath,
     };
+  }
+
+  if (fs.existsSync(outputPath) && !isFileReady(outputPath)) {
+    console.warn(`Removing incomplete audio cache file: ${outputPath}`);
+    removeFileIfExists(outputPath);
   }
 
   if (inflightTtsJobs.has(cacheKey)) {
     await inflightTtsJobs.get(cacheKey);
+    const ready = await waitForFileReady(outputPath, {
+      minBytes: MIN_AUDIO_FILE_BYTES,
+      attempts: 8,
+      delayMs: 120,
+    });
+
+    if (!ready) {
+      throw new Error(`Audio file was still not ready after TTS job completed for ${fileName}`);
+    }
+
     return {
       ok: true,
-      cached: fs.existsSync(outputPath),
+      cached: true,
       language: normalizedLanguage,
-      provider: fs.existsSync(outputPath) ? "cache" : "generated",
+      provider: "cache",
       voice: route.voice,
       text: cleanText,
       audioUrl: makeAudioUrl(req, fileName),
+      fileName,
+      filePath: outputPath,
     };
   }
 
@@ -1110,6 +1225,17 @@ async function getOrCreateTtsFile({
     inflightTtsJobs.delete(cacheKey);
   }
 
+  const ready = await waitForFileReady(outputPath, {
+    minBytes: MIN_AUDIO_FILE_BYTES,
+    attempts: 8,
+    delayMs: 120,
+  });
+
+  if (!ready) {
+    removeFileIfExists(outputPath);
+    throw new Error(`Generated audio file was not ready for playback: ${fileName}`);
+  }
+
   return {
     ok: true,
     cached: false,
@@ -1118,6 +1244,8 @@ async function getOrCreateTtsFile({
     voice: providerInfo.voice,
     text: cleanText,
     audioUrl: makeAudioUrl(req, fileName),
+    fileName,
+    filePath: outputPath,
   };
 }
 
@@ -1510,11 +1638,14 @@ app.post("/tts", async (req, res) => {
       voice,
     });
 
+    const fileSize = fs.existsSync(result.filePath) ? fs.statSync(result.filePath).size : 0;
+
     console.log("TTS response:", {
       provider: result.provider,
       voice: result.voice,
       language: result.language,
       audioUrl: result.audioUrl,
+      fileSize,
     });
 
     res.json({
@@ -1525,6 +1656,8 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       textLength: result.text.length,
       audioUrl: result.audioUrl,
+      fileName: result.fileName,
+      fileSize,
     });
   } catch (error) {
     console.error("tts error:", error);
@@ -1604,21 +1737,24 @@ app.post("/buildSessionAudio", async (req, res) => {
       req,
       text: promptText,
       language: promptAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     const targetAudio = await getOrCreateTtsFile({
       req,
       text: targetAudioText,
       language: targetAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     const revealAudio = await getOrCreateTtsFile({
       req,
       text: revealText,
       language: revealAudioLanguage,
-        voice,
+      speed: cleanSpeed,
+      voice,
     });
 
     let exampleAudio = null;
@@ -1628,7 +1764,8 @@ app.post("/buildSessionAudio", async (req, res) => {
         req,
         text: cleanExampleSentence,
         language: targetLanguage,
-            voice,
+        speed: cleanSpeed,
+        voice,
       });
     }
 
