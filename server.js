@@ -232,6 +232,53 @@ function sanitizeText(text, maxLen = 4000) {
     .slice(0, maxLen);
 }
 
+function collapseImmediateWordRepeats(text) {
+  const clean = sanitizeText(text, 4000);
+  if (!clean) return "";
+
+  const parts = clean.split(/(\s+)/);
+  const collapsed = [];
+  let lastWord = null;
+
+  for (const part of parts) {
+    if (!part.trim()) {
+      collapsed.push(part);
+      continue;
+    }
+
+    const normalized = part
+      .toLowerCase()
+      .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+
+    if (normalized && normalized === lastWord) {
+      continue;
+    }
+
+    collapsed.push(part);
+    if (normalized) {
+      lastWord = normalized;
+    }
+  }
+
+  return collapsed.join("").replace(/\s+/g, " ").trim();
+}
+
+function normalizeGeneratedSentence(text, { difficulty = "beginner" } = {}) {
+  let clean = collapseImmediateWordRepeats(text);
+
+  if (!clean) return "";
+
+  if (normalizeDifficulty(difficulty) === "beginner") {
+    clean = clean
+      .replace(/i have come/gi, "I come")
+      .replace(/i have arrived/gi, "I arrive")
+      .replace(/i came early/gi, "I come early")
+      .replace(/i have come early/gi, "I come early");
+  }
+
+  return clean;
+}
+
 function sanitizeTtsText(text) {
   return sanitizeText(text, 4000);
 }
@@ -348,7 +395,8 @@ function stripMeaningNoise(value) {
 }
 
 function normalizeBasqueSurfaceForm(term, meaning) {
-  const cleanTerm = sanitizeShortLabel(term || "", 250);
+  const cleanTerm = sanitizeShortLabel(term || "", 250)
+    .replace(/^etori$/i, "etorri");
   const normalizedMeaning = normalizeMeaningForLookup(stripMeaningNoise(meaning));
   const colorMap = {
     green: "berde",
@@ -380,7 +428,7 @@ function normalizeBasqueSurfaceForm(term, meaning) {
   return cleanTerm;
 }
 
-function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
+function applyKnownTermCorrections({ targetLanguage, baseLanguage, items, difficulty = "beginner" }) {
   const normalizedTarget = normalizeLanguage(targetLanguage);
   if (!Array.isArray(items) || items.length === 0) return [];
 
@@ -390,10 +438,10 @@ function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
       term: sanitizeShortLabel(item.term || "", 250),
       meaning: stripMeaningNoise(item.meaning || ""),
       safeExampleSentences: Array.isArray(item.safeExampleSentences)
-        ? item.safeExampleSentences.map((s) => sanitizeText(s, 250))
+        ? item.safeExampleSentences.map((s) => normalizeGeneratedSentence(s, { difficulty }))
         : [],
       exampleTranslations: Array.isArray(item.exampleTranslations)
-        ? item.exampleTranslations.map((s) => sanitizeText(s, 250))
+        ? item.exampleTranslations.map((s) => normalizeGeneratedSentence(s, { difficulty }))
         : [],
     };
 
@@ -711,6 +759,8 @@ Beginner rules:
 - Keep meanings simple and clear.
 - Example sentences must be very short and easy.
 - Prefer present tense and simple sentence patterns.
+- Do not use present perfect or other tense shifts for beginner translations unless explicitly required.
+- Avoid duplicated words like "goiz goiz" unless the user explicitly provided them.
 - Avoid rare grammar, idioms, slang, figurative language, or long clauses.
 - Keep most example sentences around 3 to 6 words when possible.
 - Do not make the examples too hard for a true beginner.
@@ -991,8 +1041,22 @@ function applyPronunciationOverrides(text, language) {
   const normalized = normalizeLanguage(language);
 
   if (normalized === "basque") {
-    if (cleanText.toLowerCase() === "lo egiten." || cleanText.toLowerCase() === "lo egiten") {
-      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
+    const stripped = cleanText.toLowerCase().replace(/[.!?]+$/g, "").trim();
+    const basqueSingleWordOverrides = {
+      ama: '<phoneme alphabet="ipa" ph="ama">ama</phoneme><break time="220ms"/>',
+      guk: '<phoneme alphabet="ipa" ph="ɡuk">guk</phoneme><break time="220ms"/>',
+      goiz: '<phoneme alphabet="ipa" ph="ɡois̻">goiz</phoneme><break time="220ms"/>',
+      egun: '<phoneme alphabet="ipa" ph="eɡun">egun</phoneme><break time="220ms"/>',
+      etorri: '<phoneme alphabet="ipa" ph="etorːi">etorri</phoneme><break time="220ms"/>',
+      ogia: '<phoneme alphabet="ipa" ph="oɡia">ogia</phoneme><break time="220ms"/>',
+    };
+
+    if (basqueSingleWordOverrides[stripped]) {
+      return basqueSingleWordOverrides[stripped];
+    }
+
+    if (stripped === "lo egiten") {
+      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme><break time="220ms"/>';
     }
   }
 
@@ -1622,6 +1686,7 @@ app.post("/generateSet", async (req, res) => {
     const items = applyKnownTermCorrections({
       targetLanguage,
       baseLanguage,
+      difficulty: cleanDifficulty,
       items: (parsed.items || [])
         .slice(0, cleanDesiredCount)
         .map((item) => {
