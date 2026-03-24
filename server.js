@@ -428,38 +428,96 @@ function normalizeBasqueSurfaceForm(term, meaning) {
   return cleanTerm;
 }
 
-function applyKnownTermCorrections({ targetLanguage, baseLanguage, items, difficulty = "beginner" }) {
+function isFunctionWord(term, targetLanguage) {
+  const normalizedTarget = normalizeLanguage(targetLanguage);
+  const normalizedTerm = String(term || "").trim().toLowerCase();
+
+  if (!normalizedTerm) return false;
+
+  if (normalizedTarget === "basque") {
+    return [
+      "ez", "eta", "ere", "baina", "edo", "baita", "ba", "al",
+      "da", "naiz", "gara", "zara", "dira", "dut", "duzu", "du", "dugu", "duzue", "dute",
+    ].includes(normalizedTerm);
+  }
+
+  return false;
+}
+
+function shouldFilterStandaloneItem({ term, wordType, targetLanguage, difficulty, mode }) {
+  const cleanDifficulty = normalizeDifficulty(difficulty);
+  const cleanMode = String(mode || "").trim().toLowerCase();
+  const normalizedType = String(wordType || "").trim().toLowerCase();
+
+  if (cleanMode === "manual") return false;
+  if (!["intermediate", "advanced"].includes(cleanDifficulty)) return false;
+
+  return isFunctionWord(term, targetLanguage) || ["other", "adverb"].includes(normalizedType);
+}
+
+function enforceLevelAwareItemRules({ item, targetLanguage, baseLanguage, difficulty, mode }) {
+  const next = { ...item };
+  const cleanDifficulty = normalizeDifficulty(difficulty);
+
+  next.term = sanitizeShortLabel(next.term || "", 250);
+  next.meaning = stripMeaningNoise(next.meaning || "");
+  next.safeExampleSentences = Array.isArray(next.safeExampleSentences)
+    ? next.safeExampleSentences.map((s) => normalizeGeneratedSentence(s, { difficulty: cleanDifficulty })).filter(Boolean)
+    : [];
+  next.exampleTranslations = Array.isArray(next.exampleTranslations)
+    ? next.exampleTranslations.map((s) => normalizeGeneratedSentence(s, { difficulty: cleanDifficulty })).filter(Boolean)
+    : [];
+
+  if (shouldFilterStandaloneItem({
+    term: next.term,
+    wordType: next.wordType,
+    targetLanguage,
+    difficulty: cleanDifficulty,
+    mode,
+  })) {
+    return null;
+  }
+
+  if (isFunctionWord(next.term, targetLanguage)) {
+    if (normalizeLanguage(targetLanguage) === "basque" && next.term.toLowerCase() === "ez") {
+      next.meaning = cleanDifficulty === "beginner" ? "no / not (negative marker)" : "negative marker used to negate a sentence";
+    }
+    next.wordType = "other";
+    next.promptType = "recall";
+  }
+
+  return next;
+}
+
+function applyKnownTermCorrections({ targetLanguage, baseLanguage, items, difficulty = "beginner", mode = "manual" }) {
   const normalizedTarget = normalizeLanguage(targetLanguage);
   if (!Array.isArray(items) || items.length === 0) return [];
 
-  return items.map((item) => {
-    const next = {
-      ...item,
-      term: sanitizeShortLabel(item.term || "", 250),
-      meaning: stripMeaningNoise(item.meaning || ""),
-      safeExampleSentences: Array.isArray(item.safeExampleSentences)
-        ? item.safeExampleSentences.map((s) => normalizeGeneratedSentence(s, { difficulty }))
-        : [],
-      exampleTranslations: Array.isArray(item.exampleTranslations)
-        ? item.exampleTranslations.map((s) => normalizeGeneratedSentence(s, { difficulty }))
-        : [],
-    };
+  return items
+    .map((item) => enforceLevelAwareItemRules({
+      item,
+      targetLanguage,
+      baseLanguage,
+      difficulty,
+      mode,
+    }))
+    .filter(Boolean)
+    .map((next) => {
+      if (normalizedTarget === "basque") {
+        const correctedNumber = basqueNumberForMeaning(next.meaning);
+        if (correctedNumber) {
+          next.term = correctedNumber;
+        }
 
-    if (normalizedTarget === "basque") {
-      const correctedNumber = basqueNumberForMeaning(next.meaning);
-      if (correctedNumber) {
-        next.term = correctedNumber;
+        next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
+
+        if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
+          next.term = "hemeretzi";
+        }
       }
 
-      next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
-
-      if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
-        next.term = "hemeretzi";
-      }
-    }
-
-    return next;
-  });
+      return next;
+    });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -775,6 +833,8 @@ Intermediate rules:
 - Use common but slightly broader vocabulary.
 - Example sentences should still be natural and clear.
 - Some variation in tense is okay.
+- Prefer sentence-based learning over isolated grammar particles.
+- Do not surface negation markers, auxiliaries, or function words as plain standalone cards unless the user explicitly asked for grammar study.
 - Moderate sentence length is okay.
 - Avoid highly literary, technical, or obscure phrasing.
 `;
@@ -837,6 +897,9 @@ Important sentence rules:
 - The term should appear naturally in at least one example sentence when possible.
 - Do not use overly advanced sentence structures for beginner mode.
 - Keep punctuation simple.
+- Do not teach grammar/function words as plain standalone beginner vocab cards unless clearly labeled.
+- For intermediate and advanced sets, prefer sentence-based teaching for grammar markers, negation, auxiliaries, particles, and connectors.
+- Avoid returning items like a bare negation marker translated as a simple standalone word.
 
 For MANUAL vocab mode:
 - keep the original term exactly as provided
@@ -849,6 +912,7 @@ For PROMPT mode:
 For IMAGE mode:
 - use the image and notes together
 - prioritize visible objects, simple actions, locations, colors, and basic descriptors
+- if the notes include grammar markers or helper words, use them in sentences instead of weak standalone flashcard-style items
 
 Prompt family:
 - choose exactly one of:
@@ -1687,6 +1751,7 @@ app.post("/generateSet", async (req, res) => {
       targetLanguage,
       baseLanguage,
       difficulty: cleanDifficulty,
+      mode: cleanMode,
       items: (parsed.items || [])
         .slice(0, cleanDesiredCount)
         .map((item) => {
