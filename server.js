@@ -287,6 +287,50 @@ function sanitizeShortLabel(text, maxLen = 200) {
   return sanitizeText(text, maxLen);
 }
 
+function uniqueNonEmptyStrings(values, maxItems = 2) {
+  const result = [];
+  const seen = new Set();
+
+  for (const value of Array.isArray(values) ? values : []) {
+    const clean = sanitizeText(value, 400).trim();
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(clean);
+    if (result.length >= maxItems) break;
+  }
+
+  return result;
+}
+
+function dedupeLessonItems(items, maxItems = 25) {
+  const result = [];
+  const seen = new Set();
+
+  for (const item of Array.isArray(items) ? items : []) {
+    const term = sanitizeShortLabel(item?.term || "", 250);
+    const meaning = stripMeaningNoise(item?.meaning || "");
+    if (!term || !meaning) continue;
+
+    const key = `${normalizeLanguage(item?.language || "")}|${term.toLowerCase()}|${meaning.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    result.push({
+      ...item,
+      term,
+      meaning,
+      safeExampleSentences: uniqueNonEmptyStrings(item?.safeExampleSentences || [], 2),
+      exampleTranslations: uniqueNonEmptyStrings(item?.exampleTranslations || [], 2),
+    });
+
+    if (result.length >= maxItems) break;
+  }
+
+  return result;
+}
+
 function safeJsonParse(text, fallback = null) {
   try {
     return JSON.parse(text);
@@ -1752,48 +1796,42 @@ app.post("/generateSet", async (req, res) => {
       baseLanguage,
       difficulty: cleanDifficulty,
       mode: cleanMode,
-      items: (parsed.items || [])
-        .slice(0, cleanDesiredCount)
-        .map((item) => {
-          const term = String(item.term ?? "").trim();
-          const meaning = String(item.meaning ?? "").trim();
-          const wordType = String(item.guessedWordType ?? "other").trim();
-          const promptType = String(item.promptFamily ?? "recall").trim();
+      items: dedupeLessonItems(
+        (parsed.items || [])
+          .slice(0, cleanDesiredCount)
+          .map((item) => {
+            const term = String(item.term ?? "").trim();
+            const meaning = String(item.meaning ?? "").trim();
+            const wordType = String(item.guessedWordType ?? "other").trim();
+            const promptType = String(item.promptFamily ?? "recall").trim();
 
-          let safeExampleSentences = Array.isArray(item.safeExampleSentences)
-            ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
-            : [];
+            const safeExampleSentences = uniqueNonEmptyStrings(
+              Array.isArray(item.safeExampleSentences)
+                ? item.safeExampleSentences.map((s) => String(s ?? "").trim())
+                : [term],
+              2,
+            );
 
-          let exampleTranslations = Array.isArray(item.exampleTranslations)
-            ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
-            : [];
+            const exampleTranslations = uniqueNonEmptyStrings(
+              Array.isArray(item.exampleTranslations)
+                ? item.exampleTranslations.map((s) => String(s ?? "").trim())
+                : [meaning],
+              2,
+            );
 
-          if (safeExampleSentences.length === 0) {
-            safeExampleSentences = [term, term];
-          } else if (safeExampleSentences.length === 1) {
-            safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
-          } else {
-            safeExampleSentences = safeExampleSentences.slice(0, 2);
-          }
-
-          if (exampleTranslations.length === 0) {
-            exampleTranslations = [meaning, meaning];
-          } else if (exampleTranslations.length === 1) {
-            exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
-          } else {
-            exampleTranslations = exampleTranslations.slice(0, 2);
-          }
-
-          return {
-            term,
-            meaning,
-            wordType,
-            promptType,
-            safeExampleSentences,
-            exampleTranslations,
-          };
-        })
-        .filter((item) => item.term),
+            return {
+              term,
+              meaning,
+              wordType,
+              promptType,
+              safeExampleSentences:
+                safeExampleSentences.length > 0 ? safeExampleSentences : [term],
+              exampleTranslations:
+                exampleTranslations.length > 0 ? exampleTranslations : [meaning],
+            };
+          }),
+        cleanDesiredCount,
+      ),
     });
 
     res.json({
@@ -2100,15 +2138,31 @@ app.post('/ttsBatch', async (req, res) => {
       return res.status(400).json({ error: 'lines[] is required' });
     }
 
+    const seenBatchKeys = new Set();
     const capped = lines
       .map((line) => ({
         text: String(line?.text || '').trim(),
         language: String(line?.language || '').trim(),
       }))
       .filter((line) => line.text && line.language)
+      .filter((line) => {
+        const key = `${line.language.toLowerCase()}|${line.text.toLowerCase()}`;
+        if (seenBatchKeys.has(key)) return false;
+        seenBatchKeys.add(key);
+        return true;
+      })
       .slice(0, 160);
 
-    const settled = await settleWithConcurrency(capped, TTS_BATCH_CONCURRENCY, async (line) => {
+    const dedupedCapped = [];
+    const seenBatchKeys = new Set();
+    for (const line of capped) {
+      const batchKey = `${line.language.trim().toLowerCase()}|${line.text.trim().toLowerCase()}`;
+      if (seenBatchKeys.has(batchKey)) continue;
+      seenBatchKeys.add(batchKey);
+      dedupedCapped.push(line);
+    }
+
+    const settled = await settleWithConcurrency(dedupedCapped, TTS_BATCH_CONCURRENCY, async (line) => {
       const audio = await withTimeout(
         getOrCreateTtsFile({
           req,
@@ -2132,7 +2186,7 @@ app.post('/ttsBatch', async (req, res) => {
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value);
     const failures = settled
-      .map((result, index) => ({ result, line: capped[index] }))
+      .map((result, index) => ({ result, line: dedupedCapped[index] }))
       .filter(({ result }) => result.status === "rejected")
       .map(({ result, line }) => ({
         key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
