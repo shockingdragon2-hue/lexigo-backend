@@ -1077,6 +1077,7 @@ function getTtsCacheKey({ text, language, voice = "", speed = 1.0 }) {
   const route = resolvedTtsRouting({ language, voice });
   return sha256(
     JSON.stringify({
+      version: 'tts-v2',
       text: sanitizeTtsText(text),
       language: route.language,
       provider: route.provider,
