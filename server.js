@@ -2154,12 +2154,13 @@ app.post('/ttsBatch', async (req, res) => {
       .slice(0, 160);
 
     const dedupedCapped = [];
-    const seenBatchKeys = new Set();
     for (const line of capped) {
       const batchKey = `${line.language.trim().toLowerCase()}|${line.text.trim().toLowerCase()}`;
-      if (seenBatchKeys.has(batchKey)) continue;
-      seenBatchKeys.add(batchKey);
-      dedupedCapped.push(line);
+      if (dedupedCapped.some((existing) => `${existing.language.trim().toLowerCase()}|${existing.text.trim().toLowerCase()}` === batchKey)) continue;
+      dedupedCapped.push({
+        ...line,
+        text: collapseImmediateWordRepeats(line.text),
+      });
     }
 
     const settled = await settleWithConcurrency(dedupedCapped, TTS_BATCH_CONCURRENCY, async (line) => {
