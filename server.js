@@ -16,44 +16,15 @@ app.use(express.json({ limit: "25mb" }));
 
 const ROOT_DIR = process.cwd();
 const AUDIO_DIR = path.join(ROOT_DIR, "audio");
-const TMP_AUDIO_DIR = path.join(AUDIO_DIR, ".tmp");
-const MIN_AUDIO_FILE_BYTES = 512;
 
 ensureDir(AUDIO_DIR);
-ensureDir(TMP_AUDIO_DIR);
-
-
-app.get("/audio/:fileName", async (req, res) => {
-  try {
-    const requestedName = path.basename(String(req.params.fileName || ""));
-
-    if (!requestedName || !requestedName.endsWith(".mp3")) {
-      return res.status(400).json({ error: "Invalid audio file name" });
-    }
-
-    const filePath = path.join(AUDIO_DIR, requestedName);
-    const ready = await waitForFileReady(filePath, {
-      minBytes: MIN_AUDIO_FILE_BYTES,
-      attempts: 6,
-      delayMs: 120,
-    });
-
-    if (!ready) {
-      return res.status(404).json({ error: "Audio file not ready" });
-    }
-
-    const stat = fs.statSync(filePath);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Length", String(stat.size));
-    res.setHeader("Cache-Control", "public, max-age=2592000, immutable");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.sendFile(filePath);
-  } catch (error) {
-    console.error("audio route error:", error);
-    res.status(500).json({ error: "Failed to serve audio", details: error.message });
-  }
-});
+app.use(
+  "/audio",
+  express.static(AUDIO_DIR, {
+    maxAge: "30d",
+    immutable: true,
+  }),
+);
 
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
@@ -66,33 +37,6 @@ const client = new OpenAI({
 
 const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 const DEFAULT_OPENAI_VOICE = process.env.OPENAI_TTS_VOICE || "alloy";
-const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
-const ELEVENLABS_OUTPUT_FORMAT = process.env.ELEVENLABS_OUTPUT_FORMAT || "mp3_44100_128";
-const ELEVENLABS_VOICE_STABILITY = clampNumber(
-  process.env.ELEVENLABS_VOICE_STABILITY,
-  0,
-  1,
-  0.45,
-);
-const ELEVENLABS_VOICE_SIMILARITY = clampNumber(
-  process.env.ELEVENLABS_VOICE_SIMILARITY,
-  0,
-  1,
-  0.8,
-);
-const ELEVENLABS_VOICE_STYLE = clampNumber(
-  process.env.ELEVENLABS_VOICE_STYLE,
-  0,
-  1,
-  0.15,
-);
-const ELEVENLABS_SPEAKER_BOOST =
-  String(process.env.ELEVENLABS_SPEAKER_BOOST || "true").trim().toLowerCase() !== "false";
-const inflightTtsJobs = new Map();
-const TTS_JOB_TIMEOUT_MS = clampNumber(process.env.TTS_JOB_TIMEOUT_MS, 3000, 30000, 12000);
-const TTS_BATCH_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_BATCH_CONCURRENCY, 1, 12, 4)));
-const TTS_PRECACHED_ITEM_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_PRECACHED_ITEM_CONCURRENCY, 1, 12, 3)));
-const TTS_AUDIO_PART_CONCURRENCY = Math.max(1, Math.floor(clampNumber(process.env.TTS_AUDIO_PART_CONCURRENCY, 1, 6, 3)));
 
 /* -------------------------------------------------------------------------- */
 /*                                    Utils                                   */
@@ -112,115 +56,6 @@ function clampNumber(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
-}
-
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function withTimeout(promise, ms, label = "operation") {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-
-    Promise.resolve(promise).then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const list = Array.isArray(items) ? items : [];
-  if (list.length === 0) return [];
-
-  const results = new Array(list.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const current = nextIndex;
-      nextIndex += 1;
-      if (current >= list.length) return;
-      results[current] = await mapper(list[current], current);
-    }
-  }
-
-  const workerCount = Math.max(1, Math.min(concurrency, list.length));
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
-}
-
-async function settleWithConcurrency(items, concurrency, mapper) {
-  return mapWithConcurrency(items, concurrency, async (item, index) => {
-    try {
-      const value = await mapper(item, index);
-      return { status: "fulfilled", value };
-    } catch (error) {
-      return {
-        status: "rejected",
-        reason: error instanceof Error ? error.message : String(error),
-      };
-    }
-  });
-}
-
-function makeTempAudioPath(outputPath) {
-  const tempName = `${path.basename(outputPath)}.${process.pid}.${Date.now()}.${Math.random()
-    .toString(16)
-    .slice(2)}.tmp`;
-  return path.join(TMP_AUDIO_DIR, tempName);
-}
-
-function isFileReady(filePath, minBytes = MIN_AUDIO_FILE_BYTES) {
-  try {
-    const stat = fs.statSync(filePath);
-    return stat.isFile() && stat.size >= minBytes;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForFileReady(filePath, { minBytes = MIN_AUDIO_FILE_BYTES, attempts = 8, delayMs = 120 } = {}) {
-  for (let i = 0; i < attempts; i += 1) {
-    if (isFileReady(filePath, minBytes)) {
-      return true;
-    }
-    await sleep(delayMs);
-  }
-  return false;
-}
-
-function removeFileIfExists(filePath) {
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  } catch (error) {
-    console.warn(`Failed to remove file ${filePath}:`, error.message);
-  }
-}
-
-function finalizeGeneratedAudio(tempPath, outputPath) {
-  if (!isFileReady(tempPath)) {
-    removeFileIfExists(tempPath);
-    throw new Error(`Generated audio file was empty or invalid for ${path.basename(outputPath)}`);
-  }
-
-  fs.renameSync(tempPath, outputPath);
-
-  if (!isFileReady(outputPath)) {
-    removeFileIfExists(outputPath);
-    throw new Error(`Final audio file was not ready after rename for ${path.basename(outputPath)}`);
-  }
 }
 
 function sanitizeText(text, maxLen = 4000) {
@@ -255,165 +90,6 @@ function escapeSsml(text) {
     .replace(/>/g, "&gt;");
 }
 
-
-function normalizeMeaningForLookup(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[.,!?]/g, "")
-    .replace(/\s+/g, " ");
-}
-
-function basqueNumberForMeaning(meaning) {
-  const normalized = normalizeMeaningForLookup(meaning);
-  const map = {
-    "0": "zero",
-    "zero": "zero",
-    "cero": "zero",
-    "1": "bat",
-    "one": "bat",
-    "uno": "bat",
-    "una": "bat",
-    "2": "bi",
-    "two": "bi",
-    "dos": "bi",
-    "3": "hiru",
-    "three": "hiru",
-    "tres": "hiru",
-    "4": "lau",
-    "four": "lau",
-    "cuatro": "lau",
-    "5": "bost",
-    "five": "bost",
-    "cinco": "bost",
-    "6": "sei",
-    "six": "sei",
-    "seis": "sei",
-    "7": "zazpi",
-    "seven": "zazpi",
-    "siete": "zazpi",
-    "8": "zortzi",
-    "eight": "zortzi",
-    "ocho": "zortzi",
-    "9": "bederatzi",
-    "nine": "bederatzi",
-    "nueve": "bederatzi",
-    "10": "hamar",
-    "ten": "hamar",
-    "diez": "hamar",
-    "11": "hamaika",
-    "eleven": "hamaika",
-    "once": "hamaika",
-    "12": "hamabi",
-    "twelve": "hamabi",
-    "doce": "hamabi",
-    "13": "hamahiru",
-    "thirteen": "hamahiru",
-    "trece": "hamahiru",
-    "14": "hamalau",
-    "fourteen": "hamalau",
-    "catorce": "hamalau",
-    "15": "hamabost",
-    "fifteen": "hamabost",
-    "quince": "hamabost",
-    "16": "hamasei",
-    "sixteen": "hamasei",
-    "dieciseis": "hamasei",
-    "dieciséis": "hamasei",
-    "17": "hamazazpi",
-    "seventeen": "hamazazpi",
-    "diecisiete": "hamazazpi",
-    "18": "hemezortzi",
-    "eighteen": "hemezortzi",
-    "dieciocho": "hemezortzi",
-    "19": "hemeretzi",
-    "nineteen": "hemeretzi",
-    "diecinueve": "hemeretzi",
-    "20": "hogei",
-    "twenty": "hogei",
-    "veinte": "hogei",
-  };
-  return map[normalized] || null;
-}
-
-
-function stripMeaningNoise(value) {
-  let text = sanitizeShortLabel(value || "", 250);
-  text = text
-    .replace(/^(means|significa|veut dire|bedeutet|esan nahi du)\s+/i, "")
-    .replace(/^(color|colour|colore|couleur|farbe)\s+/i, "")
-    .replace(/^(the color|el color|la couleur|die farbe)\s+/i, "")
-    .trim();
-  return text;
-}
-
-function normalizeBasqueSurfaceForm(term, meaning) {
-  const cleanTerm = sanitizeShortLabel(term || "", 250);
-  const normalizedMeaning = normalizeMeaningForLookup(stripMeaningNoise(meaning));
-  const colorMap = {
-    green: "berde",
-    verde: "berde",
-    red: "gorri",
-    rojo: "gorri",
-    blue: "urdin",
-    azul: "urdin",
-    yellow: "hori",
-    amarillo: "hori",
-    black: "beltz",
-    negro: "beltz",
-    white: "zuri",
-    blanco: "zuri",
-    orange: "laranja",
-    naranja: "laranja",
-    purple: "more",
-    morado: "more",
-    brown: "marroi",
-    marron: "marroi",
-    marrón: "marroi",
-    gray: "gris",
-    grey: "gris",
-    gris: "gris",
-  };
-  if (colorMap[normalizedMeaning]) {
-    return colorMap[normalizedMeaning];
-  }
-  return cleanTerm;
-}
-
-function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
-  const normalizedTarget = normalizeLanguage(targetLanguage);
-  if (!Array.isArray(items) || items.length === 0) return [];
-
-  return items.map((item) => {
-    const next = {
-      ...item,
-      term: sanitizeShortLabel(item.term || "", 250),
-      meaning: stripMeaningNoise(item.meaning || ""),
-      safeExampleSentences: Array.isArray(item.safeExampleSentences)
-        ? item.safeExampleSentences.map((s) => sanitizeText(s, 250))
-        : [],
-      exampleTranslations: Array.isArray(item.exampleTranslations)
-        ? item.exampleTranslations.map((s) => sanitizeText(s, 250))
-        : [],
-    };
-
-    if (normalizedTarget === "basque") {
-      const correctedNumber = basqueNumberForMeaning(next.meaning);
-      if (correctedNumber) {
-        next.term = correctedNumber;
-      }
-
-      next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
-
-      if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
-        next.term = "hemeretzi";
-      }
-    }
-
-    return next;
-  });
-}
-
 /* -------------------------------------------------------------------------- */
 /*                              Language Handling                             */
 /* -------------------------------------------------------------------------- */
@@ -441,9 +117,9 @@ function azureVoiceForLanguage(language) {
     case "spanish":
       return "es-ES-ElviraNeural";
     case "english":
-      return "en-US-AriaNeural";
+      return "en-US-JennyNeural";
     case "portuguese":
-      return "pt-BR-FranciscaNeural";
+      return "pt-PT-RaquelNeural";
     case "french":
       return "fr-FR-DeniseNeural";
     case "german":
@@ -466,7 +142,7 @@ function azureLangCode(language) {
     case "english":
       return "en-US";
     case "portuguese":
-      return "pt-BR";
+      return "pt-PT";
     case "french":
       return "fr-FR";
     case "german":
@@ -505,73 +181,6 @@ function isAzureConfigured() {
   return Boolean(process.env.AZURE_SPEECH_KEY && process.env.AZURE_SPEECH_REGION);
 }
 
-function isElevenLabsConfigured() {
-  return false;
-}
-
-function elevenLabsLanguageCode(language) {
-  const normalized = normalizeLanguage(language);
-
-  switch (normalized) {
-    case "english":
-      return "en";
-    case "spanish":
-      return "es";
-    case "portuguese":
-      return "pt";
-    case "french":
-      return "fr";
-    case "german":
-      return "de";
-    case "italian":
-      return "it";
-    default:
-      return null;
-  }
-}
-
-function elevenLabsVoiceForLanguage(language, explicitVoice = "") {
-  const normalized = normalizeLanguage(language);
-  const cleanExplicit = String(explicitVoice || "").trim();
-
-  if (cleanExplicit) {
-    return cleanExplicit;
-  }
-
-  const byLanguage = {
-    english:
-      process.env.ELEVENLABS_ENGLISH_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-    spanish:
-      process.env.ELEVENLABS_SPANISH_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-    portuguese:
-      process.env.ELEVENLABS_PORTUGUESE_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-    french:
-      process.env.ELEVENLABS_FRENCH_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-    german:
-      process.env.ELEVENLABS_GERMAN_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-    italian:
-      process.env.ELEVENLABS_ITALIAN_VOICE_ID ||
-      process.env.ELEVENLABS_DEFAULT_VOICE_ID ||
-      "",
-  };
-
-  return String(byLanguage[normalized] || process.env.ELEVENLABS_DEFAULT_VOICE_ID || "").trim();
-}
-
-function shouldUseElevenLabs(language, voice = "") {
-  return false;
-}
-
 function getBaseUrl(req) {
   return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
@@ -595,7 +204,7 @@ function promptTextForSupportLanguage(key, supportLanguage, variables = {}) {
 
   const map = {
     english: {
-      listenThinkMeaning: "What do you think this means?",
+      listenThinkMeaning: "Listen and think about the meaning.",
       whatDoesThisMean: "What does this mean?",
       howDoYouSayThisIn: `How do you say this in ${targetLanguage}?`,
       tryTranslateSentence: "Try to translate this sentence.",
@@ -629,54 +238,6 @@ function promptTextForSupportLanguage(key, supportLanguage, variables = {}) {
       answerIs: `Erantzuna ${term} da.`,
       meansIs: `${term} hitzak ${meaning} esan nahi du.`,
       xInTargetIsY: `${meaning}, ${targetLanguage} hizkuntzan, ${term} da.`,
-    },
-    portuguese: {
-      listenThinkMeaning: "O que você acha que isso significa?",
-      whatDoesThisMean: "O que isso significa?",
-      howDoYouSayThisIn: `Como se diz isso em ${targetLanguage}?`,
-      tryTranslateSentence: "Tente traduzir esta frase.",
-      sayMeaningOutLoud: "Diga em voz alta o que isso significa.",
-      sayWordOutLoud: `Como se diz isso em ${targetLanguage}? Diga em voz alta.`,
-      sayMissingWordOutLoud: `Escute e depois diga em voz alta a palavra que falta em ${targetLanguage}.`,
-      answerIs: `A resposta é ${term}.`,
-      meansIs: `${term} significa ${meaning}.`,
-      xInTargetIsY: `${meaning} em ${targetLanguage} é ${term}.`,
-    },
-    french: {
-      listenThinkMeaning: "Qu'est-ce que tu penses que cela veut dire ?",
-      whatDoesThisMean: "Qu'est-ce que cela veut dire ?",
-      howDoYouSayThisIn: `Comment dit-on cela en ${targetLanguage} ?`,
-      tryTranslateSentence: "Essaie de traduire cette phrase.",
-      sayMeaningOutLoud: "Dis à voix haute ce que cela veut dire.",
-      sayWordOutLoud: `Comment dit-on cela en ${targetLanguage} ? Dis-le à voix haute.`,
-      sayMissingWordOutLoud: `Écoute puis dis à voix haute le mot manquant en ${targetLanguage}.`,
-      answerIs: `La réponse est ${term}.`,
-      meansIs: `${term} veut dire ${meaning}.`,
-      xInTargetIsY: `${meaning} en ${targetLanguage}, c'est ${term}.`,
-    },
-    german: {
-      listenThinkMeaning: "Was glaubst du, was das bedeutet?",
-      whatDoesThisMean: "Was bedeutet das?",
-      howDoYouSayThisIn: `Wie sagt man das auf ${targetLanguage}?`,
-      tryTranslateSentence: "Versuche, diesen Satz zu übersetzen.",
-      sayMeaningOutLoud: "Sag laut, was das bedeutet.",
-      sayWordOutLoud: `Wie sagt man das auf ${targetLanguage}? Sag es laut.`,
-      sayMissingWordOutLoud: `Hör zu und sag dann das fehlende ${targetLanguage}-Wort laut.`,
-      answerIs: `Die Antwort ist ${term}.`,
-      meansIs: `${term} bedeutet ${meaning}.`,
-      xInTargetIsY: `${meaning} auf ${targetLanguage} ist ${term}.`,
-    },
-    italian: {
-      listenThinkMeaning: "Che cosa pensi che significhi?",
-      whatDoesThisMean: "Che cosa significa?",
-      howDoYouSayThisIn: `Come si dice questo in ${targetLanguage}?`,
-      tryTranslateSentence: "Prova a tradurre questa frase.",
-      sayMeaningOutLoud: "Di' ad alta voce che cosa significa.",
-      sayWordOutLoud: `Come si dice questo in ${targetLanguage}? Dillo ad alta voce.`,
-      sayMissingWordOutLoud: `Ascolta e poi di' ad alta voce la parola ${targetLanguage} che manca.`,
-      answerIs: `La risposta è ${term}.`,
-      meansIs: `${term} significa ${meaning}.`,
-      xInTargetIsY: `${meaning} in ${targetLanguage} è ${term}.`,
     },
   };
 
@@ -770,20 +331,15 @@ General requirements:
 - Avoid explicit, unsafe, political, hateful, scary, medical, or disturbing content.
 - Prefer words and phrases useful in daily life.
 - Meanings should be concise and easy to understand in the base language.
-- Meanings must be the plain translation only, not a full sentence and not something like 'means green' or 'color green'.
-- Terms must be the clean dictionary-style target-language form only.
 - Each item must include:
   - term
   - meaning
   - guessedWordType
   - promptFamily
   - 2 short safeExampleSentences
-  - 2 exampleTranslations
 
 Important sentence rules:
 - safeExampleSentences must be in the TARGET language.
-- exampleTranslations must translate the matching example sentences into the BASE language.
-- Keep each translation natural, clear, and complete.
 - The term should appear naturally in at least one example sentence when possible.
 - Do not use overly advanced sentence structures for beginner mode.
 - Keep punctuation simple.
@@ -870,12 +426,6 @@ const generationSchema = {
               maxItems: 2,
               items: { type: "string" },
             },
-            exampleTranslations: {
-              type: "array",
-              minItems: 2,
-              maxItems: 2,
-              items: { type: "string" },
-            },
           },
           required: [
             "term",
@@ -883,7 +433,6 @@ const generationSchema = {
             "guessedWordType",
             "promptFamily",
             "safeExampleSentences",
-            "exampleTranslations",
           ],
         },
       },
@@ -896,213 +445,19 @@ const generationSchema = {
 /*                                   TTS                                      */
 /* -------------------------------------------------------------------------- */
 
-function resolvedTtsRouting({ language, voice = "" }) {
-  const normalizedLanguage = normalizeLanguage(language);
-  const explicitVoice = String(voice || "").trim();
-
-  if (isAzureConfigured() && azureVoiceForLanguage(normalizedLanguage)) {
-    return {
-      provider: "azure",
-      voice: azureVoiceForLanguage(normalizedLanguage),
-      language: normalizedLanguage,
-    };
-  }
-
-  return {
-    provider: "openai",
-    voice: explicitVoice || openAiVoiceForLanguage(normalizedLanguage) || DEFAULT_OPENAI_VOICE,
-    language: normalizedLanguage,
-  };
-}
-
-function getTtsCacheKey({ text, language, voice = "", speed = 1.0 }) {
-  const route = resolvedTtsRouting({ language, voice });
+function getTtsCacheKey({ text, language, speed = 1.0, voice = "" }) {
   return sha256(
     JSON.stringify({
       text: sanitizeTtsText(text),
-      language: route.language,
-      provider: route.provider,
-      voice: route.voice,
-      speed: Number(speed || 1).toFixed(2),
+      language: normalizeLanguage(language),
+      speed: clampNumber(speed, 0.5, 2.0, 1.0),
+      voice: String(voice || "").trim(),
     }),
   );
 }
 
-function looksLikeQuestion(text) {
-  return /\?$/.test(text) ||
-    /^(what|how|why|when|where|which|who|do|does|did|is|are|can|could|would|will|should|what's|how's|comment|pourquoi|quand|donde|dónde|como|cómo|que|qué)\b/i.test(text);
-}
-
-function isLikelyPromptLine(text, language) {
-  const cleanText = sanitizeTtsText(text).toLowerCase();
-  const normalizedLanguage = normalizeLanguage(language);
-
-  if (!cleanText || normalizedLanguage !== "english") {
-    return false;
-  }
-
-  const promptStarters = [
-    "what do you think",
-    "what does this mean",
-    "how do you say",
-    "say this",
-    "try to translate",
-    "translate this sentence",
-    "listen",
-    "hear the word",
-    "say your answer",
-    "good work",
-    "nice job",
-    "you got it",
-    "alright, next one",
-  ];
-
-  return promptStarters.some((starter) => cleanText.startsWith(starter));
-}
-
-function prepareTtsText(text, language) {
-  let cleanText = sanitizeTtsText(text);
-  const normalizedLanguage = normalizeLanguage(language);
-
-  if (looksLikeQuestion(cleanText) && !cleanText.endsWith("?")) {
-    cleanText = `${cleanText.replace(/[.!]+$/g, "")}?`;
-  }
-
-  const isSingleWordOrShortPhrase =
-    !/[.!?]$/.test(cleanText) &&
-    cleanText.split(/\s+/).filter(Boolean).length <= 3;
-
-  if (isSingleWordOrShortPhrase) {
-    cleanText = `${cleanText.replace(/[,:;]+$/g, "")}.`;
-  }
-
-  if (normalizedLanguage === "english") {
-    cleanText = cleanText
-      .replace(/^Listen to this word\.?\s*/i, "Listen to this word, ")
-      .replace(/^Hear the word first\.?\s*/i, "Hear the word first, ")
-      .replace(/^What do you think this means$/i, "What do you think this means?");
-  }
-
-  return cleanText;
-}
-
-function applyPronunciationOverrides(text, language) {
-  const cleanText = prepareTtsText(text, language);
-  const normalized = normalizeLanguage(language);
-
-  if (normalized === "basque") {
-    if (cleanText.toLowerCase() === "lo egiten." || cleanText.toLowerCase() === "lo egiten") {
-      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
-    }
-  }
-
-  return escapeSsml(cleanText);
-}
-
-function buildAzureSsml({ text, language, voiceName, speed = 1.0 }) {
-  const langCode = azureLangCode(language);
-  const normalizedLanguage = normalizeLanguage(language);
-  const content = applyPronunciationOverrides(text, language);
-  const isEnglishPrompt = normalizedLanguage === "english" && isLikelyPromptLine(text, language);
-  const questionLike = looksLikeQuestion(sanitizeTtsText(text));
-
-  const normalizedSpeed = clampNumber(speed, 0.7, 1.35, 1.0);
-  const ratePercent = Math.round((normalizedSpeed - 1) * 100);
-  const rate = ratePercent >= 0 ? `+${ratePercent}%` : `${ratePercent}%`;
-
-  if (isEnglishPrompt) {
-    const contour = questionLike ? ' pitch="+2Hz"' : "";
-    return `
-      <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
-        <voice name="${voiceName}">
-          <mstts:express-as style="friendly">
-            <prosody rate="${rate}"${contour}>
-              ${content}
-            </prosody>
-          </mstts:express-as>
-        </voice>
-      </speak>
-    `;
-  }
-
-  return `
-    <speak version="1.0" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">
-      <voice name="${voiceName}">
-        <prosody rate="${rate}">
-          ${content}
-        </prosody>
-      </voice>
-    </speak>
-  `;
-}
-
-async function synthesizeElevenLabsToFile({
-  text,
-  language,
-  outputPath,
-  voice = "",
-}) {
-  const cleanText = sanitizeTtsText(text);
-  const languageCode = elevenLabsLanguageCode(language);
-  const voiceId = elevenLabsVoiceForLanguage(language, voice);
-
-  if (!isElevenLabsConfigured()) {
-    throw new Error("ElevenLabs API key is not configured");
-  }
-
-  if (!languageCode) {
-    throw new Error(`ElevenLabs is not enabled for language: ${normalizeLanguage(language)}`);
-  }
-
-  if (!voiceId) {
-    throw new Error(`No ElevenLabs voice configured for language: ${normalizeLanguage(language)}`);
-  }
-
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
-      voiceId,
-    )}?output_format=${encodeURIComponent(ELEVENLABS_OUTPUT_FORMAT)}`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": process.env.ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg",
-      },
-      body: JSON.stringify({
-        text: cleanText,
-        model_id: ELEVENLABS_MODEL_ID,
-        language_code: languageCode,
-        voice_settings: {
-          stability: ELEVENLABS_VOICE_STABILITY,
-          similarity_boost: ELEVENLABS_VOICE_SIMILARITY,
-          style: ELEVENLABS_VOICE_STYLE,
-          use_speaker_boost: ELEVENLABS_SPEAKER_BOOST,
-        },
-      }),
-    },
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`ElevenLabs TTS failed (${response.status}): ${errorText}`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const tempPath = makeTempAudioPath(outputPath);
-  fs.writeFileSync(tempPath, Buffer.from(arrayBuffer));
-  finalizeGeneratedAudio(tempPath, outputPath);
-
-  return {
-    ok: true,
-    provider: "elevenlabs",
-    voice: voiceId,
-  };
-}
-
 async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }) {
   return new Promise((resolve, reject) => {
-    const tempPath = makeTempAudioPath(outputPath);
     const voiceName = azureVoiceForLanguage(language);
 
     if (!voiceName || !isAzureConfigured()) {
@@ -1118,15 +473,23 @@ async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }
     speechConfig.speechSynthesisOutputFormat =
       sdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3;
 
-    const audioConfig = sdk.AudioConfig.fromAudioFileOutput(tempPath);
+    const audioConfig = sdk.AudioConfig.fromAudioFileOutput(outputPath);
     const synthesizer = new sdk.SpeechSynthesizer(speechConfig, audioConfig);
 
-    const ssml = buildAzureSsml({
-      text,
-      language,
-      voiceName,
-      speed,
-    });
+    const safeRate = clampNumber(speed, 0.5, 2.0, 1.0);
+    const ratePercent = Math.round((safeRate - 1) * 100);
+    const cleanText = escapeSsml(sanitizeTtsText(text));
+    const langCode = azureLangCode(language);
+
+    const ssml = `
+      <speak version="1.0" xml:lang="${langCode}">
+        <voice name="${voiceName}">
+          <prosody rate="${ratePercent >= 0 ? "+" : ""}${ratePercent}%">
+            ${cleanText}
+          </prosody>
+        </voice>
+      </speak>
+    `;
 
     synthesizer.speakSsmlAsync(
       ssml,
@@ -1134,20 +497,13 @@ async function synthesizeAzureToFile({ text, language, outputPath, speed = 1.0 }
         synthesizer.close();
 
         if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
-          try {
-            finalizeGeneratedAudio(tempPath, outputPath);
-            resolve({ ok: true, provider: "azure", voice: voiceName });
-          } catch (fileError) {
-            reject(fileError);
-          }
+          resolve({ ok: true, provider: "azure", voice: voiceName });
         } else {
-          removeFileIfExists(tempPath);
           reject(new Error("Azure synthesis failed"));
         }
       },
       (err) => {
         synthesizer.close();
-        removeFileIfExists(tempPath);
         reject(err);
       },
     );
@@ -1159,7 +515,6 @@ async function synthesizeOpenAIToFile({
   outputPath,
   voice = DEFAULT_OPENAI_VOICE,
   language = "english",
-  speed = 1.0,
 }) {
   const cleanText = sanitizeTtsText(text);
   const chosenVoice = voice || openAiVoiceForLanguage(language) || DEFAULT_OPENAI_VOICE;
@@ -1171,9 +526,7 @@ async function synthesizeOpenAIToFile({
   });
 
   const buffer = Buffer.from(await mp3.arrayBuffer());
-  const tempPath = makeTempAudioPath(outputPath);
-  fs.writeFileSync(tempPath, buffer);
-  finalizeGeneratedAudio(tempPath, outputPath);
+  fs.writeFileSync(outputPath, buffer);
 
   return { ok: true, provider: "openai", voice: chosenVoice };
 }
@@ -1187,111 +540,56 @@ async function getOrCreateTtsFile({
 }) {
   const cleanText = sanitizeTtsText(text);
   const normalizedLanguage = normalizeLanguage(language);
+  const cleanSpeed = clampNumber(speed, 0.5, 2.0, 1.0);
 
   if (!cleanText) {
     throw new Error("Missing TTS text");
   }
 
-  const route = resolvedTtsRouting({
-    language: normalizedLanguage,
-    voice,
-  });
-
   const cacheKey = getTtsCacheKey({
     text: cleanText,
     language: normalizedLanguage,
+    speed: cleanSpeed,
     voice,
-    speed,
   });
 
   const fileName = `${cacheKey}.mp3`;
   const outputPath = path.join(AUDIO_DIR, fileName);
 
-  if (isFileReady(outputPath)) {
+  if (fs.existsSync(outputPath)) {
     return {
       ok: true,
       cached: true,
       language: normalizedLanguage,
       provider: "cache",
-      voice: route.voice,
+      voice:
+        voice ||
+        azureVoiceForLanguage(normalizedLanguage) ||
+        openAiVoiceForLanguage(normalizedLanguage) ||
+        DEFAULT_OPENAI_VOICE,
       text: cleanText,
       audioUrl: makeAudioUrl(req, fileName),
-      fileName,
-      filePath: outputPath,
     };
   }
-
-  if (fs.existsSync(outputPath) && !isFileReady(outputPath)) {
-    console.warn(`Removing incomplete audio cache file: ${outputPath}`);
-    removeFileIfExists(outputPath);
-  }
-
-  if (inflightTtsJobs.has(cacheKey)) {
-    await withTimeout(inflightTtsJobs.get(cacheKey), TTS_JOB_TIMEOUT_MS, `Waiting for inflight TTS job (${cacheKey.slice(0, 8)})`);
-    const ready = await waitForFileReady(outputPath, {
-      minBytes: MIN_AUDIO_FILE_BYTES,
-      attempts: 8,
-      delayMs: 120,
-    });
-
-    if (!ready) {
-      throw new Error(`Audio file was still not ready after TTS job completed for ${fileName}`);
-    }
-
-    return {
-      ok: true,
-      cached: true,
-      language: normalizedLanguage,
-      provider: "cache",
-      voice: route.voice,
-      text: cleanText,
-      audioUrl: makeAudioUrl(req, fileName),
-      fileName,
-      filePath: outputPath,
-    };
-  }
-
-  const job = withTimeout((async () => {
-    let providerInfo;
-
-    try {
-      providerInfo = await synthesizeAzureToFile({
-        text: cleanText,
-        language: normalizedLanguage,
-        outputPath,
-        speed,
-      });
-    } catch (azureError) {
-      console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
-      providerInfo = await synthesizeOpenAIToFile({
-        text: cleanText,
-        outputPath,
-        voice,
-        language: normalizedLanguage,
-        speed,
-      });
-    }
-    return providerInfo;
-  })(), TTS_JOB_TIMEOUT_MS, `TTS generation (${route.provider}:${route.voice})`);
-
-  inflightTtsJobs.set(cacheKey, job);
 
   let providerInfo;
+
   try {
-    providerInfo = await job;
-  } finally {
-    inflightTtsJobs.delete(cacheKey);
-  }
+    providerInfo = await synthesizeAzureToFile({
+      text: cleanText,
+      language: normalizedLanguage,
+      outputPath,
+      speed: cleanSpeed,
+    });
+  } catch (azureError) {
+    console.warn("Azure TTS failed, falling back to OpenAI:", azureError.message);
 
-  const ready = await waitForFileReady(outputPath, {
-    minBytes: MIN_AUDIO_FILE_BYTES,
-    attempts: 8,
-    delayMs: 120,
-  });
-
-  if (!ready) {
-    removeFileIfExists(outputPath);
-    throw new Error(`Generated audio file was not ready for playback: ${fileName}`);
+    providerInfo = await synthesizeOpenAIToFile({
+      text: cleanText,
+      outputPath,
+      voice,
+      language: normalizedLanguage,
+    });
   }
 
   return {
@@ -1302,8 +600,6 @@ async function getOrCreateTtsFile({
     voice: providerInfo.voice,
     text: cleanText,
     audioUrl: makeAudioUrl(req, fileName),
-    fileName,
-    filePath: outputPath,
   };
 }
 
@@ -1435,11 +731,7 @@ function buildRevealText({
       return cleanTerm;
     case "recall":
     default:
-      return promptTextForSupportLanguage("meansIs", baseLanguage, {
-        targetLanguage: cleanTarget,
-        term: cleanTerm,
-        meaning: cleanMeaning,
-      });
+      return cleanMeaning;
   }
 }
 
@@ -1514,10 +806,7 @@ app.get("/", (req, res) => {
     ok: true,
     message: "AI engine connected",
     azureConfigured: isAzureConfigured(),
-    elevenLabsConfigured: isElevenLabsConfigured(),
     audioBaseUrl: `${req.protocol}://${req.get("host")}/audio/`,
-    ttsJobTimeoutMs: TTS_JOB_TIMEOUT_MS,
-    ttsBatchConcurrency: TTS_BATCH_CONCURRENCY,
   });
 });
 app.get("/health", (req, res) => {
@@ -1525,11 +814,6 @@ app.get("/health", (req, res) => {
     ok: true,
     uptime: process.uptime(),
     azureConfigured: isAzureConfigured(),
-    elevenLabsConfigured: isElevenLabsConfigured(),
-    ttsJobTimeoutMs: TTS_JOB_TIMEOUT_MS,
-    ttsBatchConcurrency: TTS_BATCH_CONCURRENCY,
-    ttsPrecacheItemConcurrency: TTS_PRECACHED_ITEM_CONCURRENCY,
-    ttsAudioPartConcurrency: TTS_AUDIO_PART_CONCURRENCY,
   });
 });
 app.post("/generateSet", async (req, res) => {
@@ -1619,52 +903,35 @@ app.post("/generateSet", async (req, res) => {
 
     const parsed = safeJsonParse(response.output_text, { items: [] });
 
-    const items = applyKnownTermCorrections({
-      targetLanguage,
-      baseLanguage,
-      items: (parsed.items || [])
-        .slice(0, cleanDesiredCount)
-        .map((item) => {
-          const term = String(item.term ?? "").trim();
-          const meaning = String(item.meaning ?? "").trim();
-          const wordType = String(item.guessedWordType ?? "other").trim();
-          const promptType = String(item.promptFamily ?? "recall").trim();
+    const items = (parsed.items || [])
+      .slice(0, cleanDesiredCount)
+      .map((item) => {
+        const term = String(item.term ?? "").trim();
+        const meaning = String(item.meaning ?? "").trim();
+        const wordType = String(item.guessedWordType ?? "other").trim();
+        const promptType = String(item.promptFamily ?? "recall").trim();
 
-          let safeExampleSentences = Array.isArray(item.safeExampleSentences)
-            ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
-            : [];
+        let safeExampleSentences = Array.isArray(item.safeExampleSentences)
+          ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
+          : [];
 
-          let exampleTranslations = Array.isArray(item.exampleTranslations)
-            ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
-            : [];
+        if (safeExampleSentences.length === 0) {
+          safeExampleSentences = [term, term];
+        } else if (safeExampleSentences.length === 1) {
+          safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
+        } else {
+          safeExampleSentences = safeExampleSentences.slice(0, 2);
+        }
 
-          if (safeExampleSentences.length === 0) {
-            safeExampleSentences = [term, term];
-          } else if (safeExampleSentences.length === 1) {
-            safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
-          } else {
-            safeExampleSentences = safeExampleSentences.slice(0, 2);
-          }
-
-          if (exampleTranslations.length === 0) {
-            exampleTranslations = [meaning, meaning];
-          } else if (exampleTranslations.length === 1) {
-            exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
-          } else {
-            exampleTranslations = exampleTranslations.slice(0, 2);
-          }
-
-          return {
-            term,
-            meaning,
-            wordType,
-            promptType,
-            safeExampleSentences,
-            exampleTranslations,
-          };
-        })
-        .filter((item) => item.term),
-    });
+        return {
+          term,
+          meaning,
+          wordType,
+          promptType,
+          safeExampleSentences,
+        };
+      })
+      .filter((item) => item.term);
 
     res.json({
       ok: true,
@@ -1702,14 +969,11 @@ app.post("/tts", async (req, res) => {
       voice,
     });
 
-    const fileSize = fs.existsSync(result.filePath) ? fs.statSync(result.filePath).size : 0;
-
     console.log("TTS response:", {
       provider: result.provider,
       voice: result.voice,
       language: result.language,
       audioUrl: result.audioUrl,
-      fileSize,
     });
 
     res.json({
@@ -1720,8 +984,6 @@ app.post("/tts", async (req, res) => {
       voice: result.voice,
       textLength: result.text.length,
       audioUrl: result.audioUrl,
-      fileName: result.fileName,
-      fileSize,
     });
   } catch (error) {
     console.error("tts error:", error);
@@ -1797,80 +1059,41 @@ app.post("/buildSessionAudio", async (req, res) => {
       practiceMode: cleanPracticeMode,
     });
 
-    const audioTasks = [
-      {
-        key: "prompt",
-        required: true,
-        run: () =>
-          getOrCreateTtsFile({
-            req,
-            text: promptText,
-            language: promptAudioLanguage,
-            speed: cleanSpeed,
-            voice,
-          }),
-      },
-      {
-        key: "target",
-        required: true,
-        run: () =>
-          getOrCreateTtsFile({
-            req,
-            text: targetAudioText,
-            language: targetAudioLanguage,
-            speed: cleanSpeed,
-            voice,
-          }),
-      },
-      {
-        key: "reveal",
-        required: true,
-        run: () =>
-          getOrCreateTtsFile({
-            req,
-            text: revealText,
-            language: revealAudioLanguage,
-            speed: cleanSpeed,
-            voice,
-          }),
-      },
-      ...(includeExampleAudio && cleanExampleSentence
-        ? [{
-            key: "example",
-            required: false,
-            run: () =>
-              getOrCreateTtsFile({
-                req,
-                text: cleanExampleSentence,
-                language: targetLanguage,
-                speed: cleanSpeed,
-                voice,
-              }),
-          }]
-        : []),
-    ];
+    const promptAudio = await getOrCreateTtsFile({
+      req,
+      text: promptText,
+      language: promptAudioLanguage,
+      speed: cleanSpeed,
+      voice,
+    });
 
-    const settledAudioTasks = await settleWithConcurrency(
-      audioTasks,
-      TTS_AUDIO_PART_CONCURRENCY,
-      async (task) => withTimeout(task.run(), TTS_JOB_TIMEOUT_MS, `buildSessionAudio:${task.key}`),
-    );
+    const targetAudio = await getOrCreateTtsFile({
+      req,
+      text: targetAudioText,
+      language: targetAudioLanguage,
+      speed: cleanSpeed,
+      voice,
+    });
 
-    const audioMap = Object.fromEntries(
-      settledAudioTasks.map((result, index) => [audioTasks[index].key, result]),
-    );
+    const revealAudio = await getOrCreateTtsFile({
+      req,
+      text: revealText,
+      language: revealAudioLanguage,
+      speed: cleanSpeed,
+      voice,
+    });
 
-    for (const task of audioTasks) {
-      const result = audioMap[task.key];
-      if (task.required && result?.status !== "fulfilled") {
-        throw new Error(`Failed to prepare ${task.key} audio: ${result?.reason || "unknown error"}`);
-      }
+    let exampleAudio = null;
+
+    if (includeExampleAudio && cleanExampleSentence) {
+      exampleAudio = await getOrCreateTtsFile({
+        req,
+        text: cleanExampleSentence,
+        language: targetLanguage,
+        speed: cleanSpeed,
+        voice,
+      });
     }
-
-    const promptAudio = audioMap.prompt.value;
-    const targetAudio = audioMap.target.value;
-    const revealAudio = audioMap.reveal.value;
-    const exampleAudio = audioMap.example?.status === "fulfilled" ? audioMap.example.value : null;
 
     const sequence = [
       {
@@ -1959,74 +1182,6 @@ app.post("/buildSessionAudio", async (req, res) => {
   }
 });
 
-
-app.post('/ttsBatch', async (req, res) => {
-  try {
-    const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-    const voice = String(req.body?.voice || '').trim();
-    const speed = clampNumber(req.body?.speed, 0.7, 1.35, 1.0);
-
-    if (lines.length === 0) {
-      return res.status(400).json({ error: 'lines[] is required' });
-    }
-
-    const capped = lines
-      .map((line) => ({
-        text: String(line?.text || '').trim(),
-        language: String(line?.language || '').trim(),
-      }))
-      .filter((line) => line.text && line.language)
-      .slice(0, 160);
-
-    const settled = await settleWithConcurrency(capped, TTS_BATCH_CONCURRENCY, async (line) => {
-      const audio = await withTimeout(
-        getOrCreateTtsFile({
-          req,
-          text: line.text,
-          language: line.language,
-          voice,
-          speed,
-        }),
-        TTS_JOB_TIMEOUT_MS,
-        `ttsBatch:${line.language}:${line.text.slice(0, 40)}`
-      );
-      return {
-        key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
-        audioUrl: audio.audioUrl,
-        language: normalizeLanguage(line.language),
-        text: line.text,
-      };
-    });
-
-    const items = settled
-      .filter((result) => result.status === "fulfilled")
-      .map((result) => result.value);
-    const failures = settled
-      .map((result, index) => ({ result, line: capped[index] }))
-      .filter(({ result }) => result.status === "rejected")
-      .map(({ result, line }) => ({
-        key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
-        language: normalizeLanguage(line.language),
-        text: line.text,
-        error: result.reason,
-      }));
-
-    res.json({
-      ok: failures.length === 0,
-      count: items.length,
-      failedCount: failures.length,
-      items,
-      failures,
-    });
-  } catch (error) {
-    console.error('ttsBatch error:', error);
-    res.status(500).json({
-      error: 'Failed to build batch TTS',
-      details: error.message,
-    });
-  }
-});
-
 app.post("/precacheSessionAudio", async (req, res) => {
   try {
     const {
@@ -2045,184 +1200,127 @@ app.post("/precacheSessionAudio", async (req, res) => {
     }
 
     const cappedItems = items.slice(0, 100);
-    const cleanDelay = clampNumber(answerDelaySeconds, 0, 15, 3);
-    const cleanSpeed = clampNumber(speed, 0.5, 2.0, 1.0);
+    const results = [];
 
-    const settledItems = await settleWithConcurrency(
-      cappedItems,
-      TTS_PRECACHED_ITEM_CONCURRENCY,
-      async (item) => {
-        const term = String(item.term || "").trim();
-        const meaning = String(item.meaning || "").trim();
-        const promptFamily = normalizePromptFamily(
-          item.promptType || item.promptFamily || "recall",
-        );
-        const exampleSentence =
-          Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
-            ? String(item.safeExampleSentences[0] || "").trim()
-            : String(item.exampleSentence || "").trim();
+    for (const item of cappedItems) {
+      const term = String(item.term || "").trim();
+      const meaning = String(item.meaning || "").trim();
+      const promptFamily = normalizePromptFamily(
+        item.promptType || item.promptFamily || "recall",
+      );
+      const exampleSentence =
+        Array.isArray(item.safeExampleSentences) && item.safeExampleSentences.length > 0
+          ? String(item.safeExampleSentences[0] || "").trim()
+          : String(item.exampleSentence || "").trim();
 
-        const promptText = buildPromptText({
-          practiceMode,
-          promptFamily,
-          targetLanguage,
-          baseLanguage,
-          sentence: exampleSentence,
+      const promptText = buildPromptText({
+        practiceMode,
+        promptFamily,
+        targetLanguage,
+        baseLanguage,
+        sentence: exampleSentence,
+      });
+
+      const targetAudioText = buildTargetAudioText({
+        promptFamily,
+        term,
+        meaning,
+        sentence: exampleSentence,
+      });
+
+      const revealText = buildRevealText({
+        practiceMode,
+        promptFamily,
+        targetLanguage,
+        baseLanguage,
+        term,
+        meaning,
+      });
+
+      const promptAudioLanguage = baseLanguage;
+      const targetAudioLanguage = buildTargetAudioLanguage({
+        promptFamily,
+        targetLanguage,
+        baseLanguage,
+      });
+      const revealAudioLanguage = buildRevealAudioLanguage({
+        promptFamily,
+        targetLanguage,
+        baseLanguage,
+        practiceMode,
+      });
+
+      const promptAudio = await getOrCreateTtsFile({
+        req,
+        text: promptText,
+        language: promptAudioLanguage,
+        speed,
+        voice,
+      });
+
+      const targetAudio = await getOrCreateTtsFile({
+        req,
+        text: targetAudioText,
+        language: targetAudioLanguage,
+        speed,
+        voice,
+      });
+
+      const revealAudio = await getOrCreateTtsFile({
+        req,
+        text: revealText,
+        language: revealAudioLanguage,
+        speed,
+        voice,
+      });
+
+      let exampleAudio = null;
+      if (includeExampleAudio && exampleSentence) {
+        exampleAudio = await getOrCreateTtsFile({
+          req,
+          text: exampleSentence,
+          language: targetLanguage,
+          speed,
+          voice,
         });
+      }
 
-        const targetAudioText = buildTargetAudioText({
-          promptFamily,
-          term,
-          meaning,
-          sentence: exampleSentence,
-        });
-
-        const revealText = buildRevealText({
-          practiceMode,
-          promptFamily,
-          targetLanguage,
-          baseLanguage,
-          term,
-          meaning,
-        });
-
-        const promptAudioLanguage = baseLanguage;
-        const targetAudioLanguage = buildTargetAudioLanguage({
-          promptFamily,
-          targetLanguage,
-          baseLanguage,
-        });
-        const revealAudioLanguage = buildRevealAudioLanguage({
-          promptFamily,
-          targetLanguage,
-          baseLanguage,
-          practiceMode,
-        });
-
-        const audioTasks = [
-          {
-            key: "prompt",
-            required: true,
-            run: () =>
-              getOrCreateTtsFile({
-                req,
-                text: promptText,
-                language: promptAudioLanguage,
-                speed: cleanSpeed,
-                voice,
-              }),
+      results.push({
+        term,
+        meaning,
+        promptFamily,
+        answerDelaySeconds: clampNumber(answerDelaySeconds, 0, 15, 3),
+        audio: {
+          prompt: {
+            text: promptText,
+            language: normalizeLanguage(promptAudioLanguage),
+            audioUrl: promptAudio.audioUrl,
           },
-          {
-            key: "target",
-            required: true,
-            run: () =>
-              getOrCreateTtsFile({
-                req,
-                text: targetAudioText,
-                language: targetAudioLanguage,
-                speed: cleanSpeed,
-                voice,
-              }),
+          target: {
+            text: targetAudioText,
+            language: normalizeLanguage(targetAudioLanguage),
+            audioUrl: targetAudio.audioUrl,
           },
-          {
-            key: "reveal",
-            required: true,
-            run: () =>
-              getOrCreateTtsFile({
-                req,
-                text: revealText,
-                language: revealAudioLanguage,
-                speed: cleanSpeed,
-                voice,
-              }),
+          reveal: {
+            text: revealText,
+            language: normalizeLanguage(revealAudioLanguage),
+            audioUrl: revealAudio.audioUrl,
           },
-          ...(includeExampleAudio && exampleSentence
-            ? [{
-                key: "example",
-                required: false,
-                run: () =>
-                  getOrCreateTtsFile({
-                    req,
-                    text: exampleSentence,
-                    language: targetLanguage,
-                    speed: cleanSpeed,
-                    voice,
-                  }),
-              }]
-            : []),
-        ];
-
-        const settledAudio = await settleWithConcurrency(
-          audioTasks,
-          TTS_AUDIO_PART_CONCURRENCY,
-          async (task) => withTimeout(task.run(), TTS_JOB_TIMEOUT_MS, `precache:${task.key}:${term.slice(0, 40)}`),
-        );
-
-        const audioMap = Object.fromEntries(
-          settledAudio.map((result, index) => [audioTasks[index].key, result]),
-        );
-
-        const requiredFailure = audioTasks.find(
-          (task) => task.required && audioMap[task.key]?.status !== "fulfilled",
-        );
-
-        if (requiredFailure) {
-          throw new Error(
-            `${requiredFailure.key} audio failed for "${term || meaning || "item"}": ${audioMap[requiredFailure.key]?.reason || "unknown error"}`
-          );
-        }
-
-        return {
-          term,
-          meaning,
-          promptFamily,
-          answerDelaySeconds: cleanDelay,
-          audio: {
-            prompt: {
-              text: promptText,
-              language: normalizeLanguage(promptAudioLanguage),
-              audioUrl: audioMap.prompt.value.audioUrl,
-            },
-            target: {
-              text: targetAudioText,
-              language: normalizeLanguage(targetAudioLanguage),
-              audioUrl: audioMap.target.value.audioUrl,
-            },
-            reveal: {
-              text: revealText,
-              language: normalizeLanguage(revealAudioLanguage),
-              audioUrl: audioMap.reveal.value.audioUrl,
-            },
-            example: audioMap.example?.status === "fulfilled"
-              ? {
-                  text: exampleSentence,
-                  language: normalizeLanguage(targetLanguage),
-                  audioUrl: audioMap.example.value.audioUrl,
-                }
-              : null,
-          },
-        };
-      },
-    );
-
-    const results = settledItems
-      .filter((result) => result.status === "fulfilled")
-      .map((result) => result.value);
-    const failures = settledItems
-      .map((result, index) => ({ result, item: cappedItems[index] }))
-      .filter(({ result }) => result.status === "rejected")
-      .map(({ result, item }) => ({
-        term: String(item.term || "").trim(),
-        meaning: String(item.meaning || "").trim(),
-        error: result.reason,
-      }));
+          example: exampleAudio
+            ? {
+                text: exampleSentence,
+                language: normalizeLanguage(targetLanguage),
+                audioUrl: exampleAudio.audioUrl,
+              }
+            : null,
+        },
+      });
+    }
 
     res.json({
-      ok: failures.length === 0,
+      ok: true,
       count: results.length,
-      failedCount: failures.length,
       items: results,
-      failures,
     });
   } catch (error) {
     console.error("precacheSessionAudio error:", error);
