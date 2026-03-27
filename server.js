@@ -232,103 +232,12 @@ function sanitizeText(text, maxLen = 4000) {
     .slice(0, maxLen);
 }
 
-function collapseImmediateWordRepeats(text) {
-  const clean = sanitizeText(text, 4000);
-  if (!clean) return "";
-
-  const parts = clean.split(/(\s+)/);
-  const collapsed = [];
-  let lastWord = null;
-
-  for (const part of parts) {
-    if (!part.trim()) {
-      collapsed.push(part);
-      continue;
-    }
-
-    const normalized = part
-      .toLowerCase()
-      .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-
-    if (normalized && normalized === lastWord) {
-      continue;
-    }
-
-    collapsed.push(part);
-    if (normalized) {
-      lastWord = normalized;
-    }
-  }
-
-  return collapsed.join("").replace(/\s+/g, " ").trim();
-}
-
-function normalizeGeneratedSentence(text, { difficulty = "beginner" } = {}) {
-  let clean = collapseImmediateWordRepeats(text);
-
-  if (!clean) return "";
-
-  if (normalizeDifficulty(difficulty) === "beginner") {
-    clean = clean
-      .replace(/i have come/gi, "I come")
-      .replace(/i have arrived/gi, "I arrive")
-      .replace(/i came early/gi, "I come early")
-      .replace(/i have come early/gi, "I come early");
-  }
-
-  return clean;
-}
-
 function sanitizeTtsText(text) {
   return sanitizeText(text, 4000);
 }
 
 function sanitizeShortLabel(text, maxLen = 200) {
   return sanitizeText(text, maxLen);
-}
-
-function uniqueNonEmptyStrings(values, maxItems = 2) {
-  const result = [];
-  const seen = new Set();
-
-  for (const value of Array.isArray(values) ? values : []) {
-    const clean = sanitizeText(value, 400).trim();
-    if (!clean) continue;
-    const key = clean.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(clean);
-    if (result.length >= maxItems) break;
-  }
-
-  return result;
-}
-
-function dedupeLessonItems(items, maxItems = 25) {
-  const result = [];
-  const seen = new Set();
-
-  for (const item of Array.isArray(items) ? items : []) {
-    const term = sanitizeShortLabel(item?.term || "", 250);
-    const meaning = stripMeaningNoise(item?.meaning || "");
-    if (!term || !meaning) continue;
-
-    const key = `${normalizeLanguage(item?.language || "")}|${term.toLowerCase()}|${meaning.toLowerCase()}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    result.push({
-      ...item,
-      term,
-      meaning,
-      safeExampleSentences: uniqueNonEmptyStrings(item?.safeExampleSentences || [], 2),
-      exampleTranslations: uniqueNonEmptyStrings(item?.exampleTranslations || [], 2),
-    });
-
-    if (result.length >= maxItems) break;
-  }
-
-  return result;
 }
 
 function safeJsonParse(text, fallback = null) {
@@ -439,8 +348,7 @@ function stripMeaningNoise(value) {
 }
 
 function normalizeBasqueSurfaceForm(term, meaning) {
-  const cleanTerm = sanitizeShortLabel(term || "", 250)
-    .replace(/^etori$/i, "etorri");
+  const cleanTerm = sanitizeShortLabel(term || "", 250);
   const normalizedMeaning = normalizeMeaningForLookup(stripMeaningNoise(meaning));
   const colorMap = {
     green: "berde",
@@ -472,96 +380,38 @@ function normalizeBasqueSurfaceForm(term, meaning) {
   return cleanTerm;
 }
 
-function isFunctionWord(term, targetLanguage) {
-  const normalizedTarget = normalizeLanguage(targetLanguage);
-  const normalizedTerm = String(term || "").trim().toLowerCase();
-
-  if (!normalizedTerm) return false;
-
-  if (normalizedTarget === "basque") {
-    return [
-      "ez", "eta", "ere", "baina", "edo", "baita", "ba", "al",
-      "da", "naiz", "gara", "zara", "dira", "dut", "duzu", "du", "dugu", "duzue", "dute",
-    ].includes(normalizedTerm);
-  }
-
-  return false;
-}
-
-function shouldFilterStandaloneItem({ term, wordType, targetLanguage, difficulty, mode }) {
-  const cleanDifficulty = normalizeDifficulty(difficulty);
-  const cleanMode = String(mode || "").trim().toLowerCase();
-  const normalizedType = String(wordType || "").trim().toLowerCase();
-
-  if (cleanMode === "manual") return false;
-  if (!["intermediate", "advanced"].includes(cleanDifficulty)) return false;
-
-  return isFunctionWord(term, targetLanguage) || ["other", "adverb"].includes(normalizedType);
-}
-
-function enforceLevelAwareItemRules({ item, targetLanguage, baseLanguage, difficulty, mode }) {
-  const next = { ...item };
-  const cleanDifficulty = normalizeDifficulty(difficulty);
-
-  next.term = sanitizeShortLabel(next.term || "", 250);
-  next.meaning = stripMeaningNoise(next.meaning || "");
-  next.safeExampleSentences = Array.isArray(next.safeExampleSentences)
-    ? next.safeExampleSentences.map((s) => normalizeGeneratedSentence(s, { difficulty: cleanDifficulty })).filter(Boolean)
-    : [];
-  next.exampleTranslations = Array.isArray(next.exampleTranslations)
-    ? next.exampleTranslations.map((s) => normalizeGeneratedSentence(s, { difficulty: cleanDifficulty })).filter(Boolean)
-    : [];
-
-  if (shouldFilterStandaloneItem({
-    term: next.term,
-    wordType: next.wordType,
-    targetLanguage,
-    difficulty: cleanDifficulty,
-    mode,
-  })) {
-    return null;
-  }
-
-  if (isFunctionWord(next.term, targetLanguage)) {
-    if (normalizeLanguage(targetLanguage) === "basque" && next.term.toLowerCase() === "ez") {
-      next.meaning = cleanDifficulty === "beginner" ? "no / not (negative marker)" : "negative marker used to negate a sentence";
-    }
-    next.wordType = "other";
-    next.promptType = "recall";
-  }
-
-  return next;
-}
-
-function applyKnownTermCorrections({ targetLanguage, baseLanguage, items, difficulty = "beginner", mode = "manual" }) {
+function applyKnownTermCorrections({ targetLanguage, baseLanguage, items }) {
   const normalizedTarget = normalizeLanguage(targetLanguage);
   if (!Array.isArray(items) || items.length === 0) return [];
 
-  return items
-    .map((item) => enforceLevelAwareItemRules({
-      item,
-      targetLanguage,
-      baseLanguage,
-      difficulty,
-      mode,
-    }))
-    .filter(Boolean)
-    .map((next) => {
-      if (normalizedTarget === "basque") {
-        const correctedNumber = basqueNumberForMeaning(next.meaning);
-        if (correctedNumber) {
-          next.term = correctedNumber;
-        }
+  return items.map((item) => {
+    const next = {
+      ...item,
+      term: sanitizeShortLabel(item.term || "", 250),
+      meaning: stripMeaningNoise(item.meaning || ""),
+      safeExampleSentences: Array.isArray(item.safeExampleSentences)
+        ? item.safeExampleSentences.map((s) => sanitizeText(s, 250))
+        : [],
+      exampleTranslations: Array.isArray(item.exampleTranslations)
+        ? item.exampleTranslations.map((s) => sanitizeText(s, 250))
+        : [],
+    };
 
-        next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
-
-        if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
-          next.term = "hemeretzi";
-        }
+    if (normalizedTarget === "basque") {
+      const correctedNumber = basqueNumberForMeaning(next.meaning);
+      if (correctedNumber) {
+        next.term = correctedNumber;
       }
 
-      return next;
-    });
+      next.term = normalizeBasqueSurfaceForm(next.term, next.meaning);
+
+      if (normalizeMeaningForLookup(next.term) === "hemezortzi" && basqueNumberForMeaning(next.meaning) === "hemeretzi") {
+        next.term = "hemeretzi";
+      }
+    }
+
+    return next;
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -861,8 +711,6 @@ Beginner rules:
 - Keep meanings simple and clear.
 - Example sentences must be very short and easy.
 - Prefer present tense and simple sentence patterns.
-- Do not use present perfect or other tense shifts for beginner translations unless explicitly required.
-- Avoid duplicated words like "goiz goiz" unless the user explicitly provided them.
 - Avoid rare grammar, idioms, slang, figurative language, or long clauses.
 - Keep most example sentences around 3 to 6 words when possible.
 - Do not make the examples too hard for a true beginner.
@@ -877,8 +725,6 @@ Intermediate rules:
 - Use common but slightly broader vocabulary.
 - Example sentences should still be natural and clear.
 - Some variation in tense is okay.
-- Prefer sentence-based learning over isolated grammar particles.
-- Do not surface negation markers, auxiliaries, or function words as plain standalone cards unless the user explicitly asked for grammar study.
 - Moderate sentence length is okay.
 - Avoid highly literary, technical, or obscure phrasing.
 `;
@@ -941,9 +787,6 @@ Important sentence rules:
 - The term should appear naturally in at least one example sentence when possible.
 - Do not use overly advanced sentence structures for beginner mode.
 - Keep punctuation simple.
-- Do not teach grammar/function words as plain standalone beginner vocab cards unless clearly labeled.
-- For intermediate and advanced sets, prefer sentence-based teaching for grammar markers, negation, auxiliaries, particles, and connectors.
-- Avoid returning items like a bare negation marker translated as a simple standalone word.
 
 For MANUAL vocab mode:
 - keep the original term exactly as provided
@@ -956,7 +799,6 @@ For PROMPT mode:
 For IMAGE mode:
 - use the image and notes together
 - prioritize visible objects, simple actions, locations, colors, and basic descriptors
-- if the notes include grammar markers or helper words, use them in sentences instead of weak standalone flashcard-style items
 
 Prompt family:
 - choose exactly one of:
@@ -1077,7 +919,6 @@ function getTtsCacheKey({ text, language, voice = "", speed = 1.0 }) {
   const route = resolvedTtsRouting({ language, voice });
   return sha256(
     JSON.stringify({
-      version: 'tts-v2',
       text: sanitizeTtsText(text),
       language: route.language,
       provider: route.provider,
@@ -1150,22 +991,8 @@ function applyPronunciationOverrides(text, language) {
   const normalized = normalizeLanguage(language);
 
   if (normalized === "basque") {
-    const stripped = cleanText.toLowerCase().replace(/[.!?]+$/g, "").trim();
-    const basqueSingleWordOverrides = {
-      ama: '<phoneme alphabet="ipa" ph="ama">ama</phoneme><break time="220ms"/>',
-      guk: '<phoneme alphabet="ipa" ph="ɡuk">guk</phoneme><break time="220ms"/>',
-      goiz: '<phoneme alphabet="ipa" ph="ɡois̻">goiz</phoneme><break time="220ms"/>',
-      egun: '<phoneme alphabet="ipa" ph="eɡun">egun</phoneme><break time="220ms"/>',
-      etorri: '<phoneme alphabet="ipa" ph="etorːi">etorri</phoneme><break time="220ms"/>',
-      ogia: '<phoneme alphabet="ipa" ph="oɡia">ogia</phoneme><break time="220ms"/>',
-    };
-
-    if (basqueSingleWordOverrides[stripped]) {
-      return basqueSingleWordOverrides[stripped];
-    }
-
-    if (stripped === "lo egiten") {
-      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme><break time="220ms"/>';
+    if (cleanText.toLowerCase() === "lo egiten." || cleanText.toLowerCase() === "lo egiten") {
+      return '<phoneme alphabet="ipa" ph="lo eɣiten">lo egiten</phoneme>';
     }
   }
 
@@ -1795,44 +1622,48 @@ app.post("/generateSet", async (req, res) => {
     const items = applyKnownTermCorrections({
       targetLanguage,
       baseLanguage,
-      difficulty: cleanDifficulty,
-      mode: cleanMode,
-      items: dedupeLessonItems(
-        (parsed.items || [])
-          .slice(0, cleanDesiredCount)
-          .map((item) => {
-            const term = String(item.term ?? "").trim();
-            const meaning = String(item.meaning ?? "").trim();
-            const wordType = String(item.guessedWordType ?? "other").trim();
-            const promptType = String(item.promptFamily ?? "recall").trim();
+      items: (parsed.items || [])
+        .slice(0, cleanDesiredCount)
+        .map((item) => {
+          const term = String(item.term ?? "").trim();
+          const meaning = String(item.meaning ?? "").trim();
+          const wordType = String(item.guessedWordType ?? "other").trim();
+          const promptType = String(item.promptFamily ?? "recall").trim();
 
-            const safeExampleSentences = uniqueNonEmptyStrings(
-              Array.isArray(item.safeExampleSentences)
-                ? item.safeExampleSentences.map((s) => String(s ?? "").trim())
-                : [term],
-              2,
-            );
+          let safeExampleSentences = Array.isArray(item.safeExampleSentences)
+            ? item.safeExampleSentences.map((s) => String(s ?? "").trim()).filter(Boolean)
+            : [];
 
-            const exampleTranslations = uniqueNonEmptyStrings(
-              Array.isArray(item.exampleTranslations)
-                ? item.exampleTranslations.map((s) => String(s ?? "").trim())
-                : [meaning],
-              2,
-            );
+          let exampleTranslations = Array.isArray(item.exampleTranslations)
+            ? item.exampleTranslations.map((s) => String(s ?? "").trim()).filter(Boolean)
+            : [];
 
-            return {
-              term,
-              meaning,
-              wordType,
-              promptType,
-              safeExampleSentences:
-                safeExampleSentences.length > 0 ? safeExampleSentences : [term],
-              exampleTranslations:
-                exampleTranslations.length > 0 ? exampleTranslations : [meaning],
-            };
-          }),
-        cleanDesiredCount,
-      ),
+          if (safeExampleSentences.length === 0) {
+            safeExampleSentences = [term, term];
+          } else if (safeExampleSentences.length === 1) {
+            safeExampleSentences = [safeExampleSentences[0], safeExampleSentences[0]];
+          } else {
+            safeExampleSentences = safeExampleSentences.slice(0, 2);
+          }
+
+          if (exampleTranslations.length === 0) {
+            exampleTranslations = [meaning, meaning];
+          } else if (exampleTranslations.length === 1) {
+            exampleTranslations = [exampleTranslations[0], exampleTranslations[0]];
+          } else {
+            exampleTranslations = exampleTranslations.slice(0, 2);
+          }
+
+          return {
+            term,
+            meaning,
+            wordType,
+            promptType,
+            safeExampleSentences,
+            exampleTranslations,
+          };
+        })
+        .filter((item) => item.term),
     });
 
     res.json({
@@ -2139,32 +1970,15 @@ app.post('/ttsBatch', async (req, res) => {
       return res.status(400).json({ error: 'lines[] is required' });
     }
 
-    const seenBatchKeys = new Set();
     const capped = lines
       .map((line) => ({
         text: String(line?.text || '').trim(),
         language: String(line?.language || '').trim(),
       }))
       .filter((line) => line.text && line.language)
-      .filter((line) => {
-        const key = `${line.language.toLowerCase()}|${line.text.toLowerCase()}`;
-        if (seenBatchKeys.has(key)) return false;
-        seenBatchKeys.add(key);
-        return true;
-      })
       .slice(0, 160);
 
-    const dedupedCapped = [];
-    for (const line of capped) {
-      const batchKey = `${line.language.trim().toLowerCase()}|${line.text.trim().toLowerCase()}`;
-      if (dedupedCapped.some((existing) => `${existing.language.trim().toLowerCase()}|${existing.text.trim().toLowerCase()}` === batchKey)) continue;
-      dedupedCapped.push({
-        ...line,
-        text: collapseImmediateWordRepeats(line.text),
-      });
-    }
-
-    const settled = await settleWithConcurrency(dedupedCapped, TTS_BATCH_CONCURRENCY, async (line) => {
+    const settled = await settleWithConcurrency(capped, TTS_BATCH_CONCURRENCY, async (line) => {
       const audio = await withTimeout(
         getOrCreateTtsFile({
           req,
@@ -2188,7 +2002,7 @@ app.post('/ttsBatch', async (req, res) => {
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value);
     const failures = settled
-      .map((result, index) => ({ result, line: dedupedCapped[index] }))
+      .map((result, index) => ({ result, line: capped[index] }))
       .filter(({ result }) => result.status === "rejected")
       .map(({ result, line }) => ({
         key: `${line.language.trim().toLowerCase()}|${line.text.trim()}`,
