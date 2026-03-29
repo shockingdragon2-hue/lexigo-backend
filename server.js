@@ -1066,7 +1066,7 @@ app.post("/ttsBatch", async (req, res) => {
       deduped.push({ text, language, key });
     }
 
-    const items = await mapWithConcurrency(deduped, 4, async (line) => {
+    const items = await mapWithConcurrency(deduped, 5, async (line) => {
       const audio = await getOrCreateTtsFile({
         req,
         text: line.text,
@@ -1303,7 +1303,7 @@ app.post("/precacheSessionAudio", async (req, res) => {
     }
 
     const cappedItems = items.slice(0, 100);
-    const results = await mapWithConcurrency(cappedItems, 3, async (item) => {
+    const results = await mapWithConcurrency(cappedItems, 4, async (item) => {
       const term = String(item.term || "").trim();
       const meaning = String(item.meaning || "").trim();
       const promptFamily = normalizePromptFamily(
