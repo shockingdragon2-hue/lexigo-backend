@@ -189,6 +189,27 @@ function makeAudioUrl(req, fileName) {
   return `${getBaseUrl(req)}/audio/${fileName}`;
 }
 
+async function mapWithConcurrency(items, limit, mapper) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 1, 6));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(safeLimit, items.length) },
+    () => worker(),
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                          Support-Language Prompts                          */
 /* -------------------------------------------------------------------------- */
@@ -1023,6 +1044,59 @@ app.post("/tts", async (req, res) => {
   }
 });
 
+app.post("/ttsBatch", async (req, res) => {
+  try {
+    const { lines = [], speed = 1.0, voice = "" } = req.body || {};
+
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return res.status(400).json({ error: "lines[] is required" });
+    }
+
+    const cleanSpeed = clampNumber(speed, 0.5, 2.0, 1.0);
+    const deduped = [];
+    const seen = new Set();
+
+    for (const line of lines.slice(0, 100)) {
+      const text = String(line.text || "").trim();
+      const language = String(line.language || "").trim();
+      if (!text || !language) continue;
+      const key = `${normalizeLanguage(language)}|${cleanSpeed.toFixed(2)}|${text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push({ text, language, key });
+    }
+
+    const items = await mapWithConcurrency(deduped, 4, async (line) => {
+      const audio = await getOrCreateTtsFile({
+        req,
+        text: line.text,
+        language: line.language,
+        speed: cleanSpeed,
+        voice,
+      });
+
+      return {
+        key: line.key,
+        text: line.text,
+        language: normalizeLanguage(line.language),
+        audioUrl: audio.audioUrl,
+      };
+    });
+
+    res.json({
+      ok: true,
+      count: items.length,
+      items,
+    });
+  } catch (error) {
+    console.error("ttsBatch error:", error);
+    res.status(500).json({
+      error: "TTS batch failed",
+      details: error.message,
+    });
+  }
+});
+
 app.post("/buildSessionAudio", async (req, res) => {
   try {
     const {
@@ -1229,9 +1303,7 @@ app.post("/precacheSessionAudio", async (req, res) => {
     }
 
     const cappedItems = items.slice(0, 100);
-    const results = [];
-
-    for (const item of cappedItems) {
+    const results = await mapWithConcurrency(cappedItems, 3, async (item) => {
       const term = String(item.term || "").trim();
       const meaning = String(item.meaning || "").trim();
       const promptFamily = normalizePromptFamily(
@@ -1279,42 +1351,40 @@ app.post("/precacheSessionAudio", async (req, res) => {
         practiceMode,
       });
 
-      const promptAudio = await getOrCreateTtsFile({
-        req,
-        text: promptText,
-        language: promptAudioLanguage,
-        speed,
-        voice,
-      });
-
-      const targetAudio = await getOrCreateTtsFile({
-        req,
-        text: targetAudioText,
-        language: targetAudioLanguage,
-        speed,
-        voice,
-      });
-
-      const revealAudio = await getOrCreateTtsFile({
-        req,
-        text: revealText,
-        language: revealAudioLanguage,
-        speed,
-        voice,
-      });
-
-      let exampleAudio = null;
-      if (includeExampleAudio && exampleSentence) {
-        exampleAudio = await getOrCreateTtsFile({
+      const [promptAudio, targetAudio, revealAudio, exampleAudio] = await Promise.all([
+        getOrCreateTtsFile({
           req,
-          text: exampleSentence,
-          language: targetLanguage,
+          text: promptText,
+          language: promptAudioLanguage,
           speed,
           voice,
-        });
-      }
+        }),
+        getOrCreateTtsFile({
+          req,
+          text: targetAudioText,
+          language: targetAudioLanguage,
+          speed,
+          voice,
+        }),
+        getOrCreateTtsFile({
+          req,
+          text: revealText,
+          language: revealAudioLanguage,
+          speed,
+          voice,
+        }),
+        includeExampleAudio && exampleSentence
+          ? getOrCreateTtsFile({
+              req,
+              text: exampleSentence,
+              language: targetLanguage,
+              speed,
+              voice,
+            })
+          : Promise.resolve(null),
+      ]);
 
-      results.push({
+      return {
         term,
         meaning,
         promptFamily,
@@ -1343,8 +1413,8 @@ app.post("/precacheSessionAudio", async (req, res) => {
               }
             : null,
         },
-      });
-    }
+      };
+    });
 
     res.json({
       ok: true,
