@@ -1430,6 +1430,395 @@ app.post("/precacheSessionAudio", async (req, res) => {
   }
 });
 
+
+/* -------------------------------------------------------------------------- */
+/*                         Tutor / Student Homework MVP                       */
+/* -------------------------------------------------------------------------- */
+
+const DATA_STORE_PATH = path.join(ROOT_DIR, "data_store.json");
+
+function generateId(prefix = "id") {
+  return `${prefix}_${crypto.randomUUID()}`;
+}
+
+function ensureDataStore() {
+  if (!fs.existsSync(DATA_STORE_PATH)) {
+    const initial = {
+      users: [],
+      tutorStudentLinks: [],
+      assignments: [],
+    };
+    fs.writeFileSync(DATA_STORE_PATH, JSON.stringify(initial, null, 2));
+  }
+}
+
+function readDataStore() {
+  ensureDataStore();
+  try {
+    const raw = fs.readFileSync(DATA_STORE_PATH, "utf8");
+    const parsed = safeJsonParse(raw, null);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Invalid data store");
+    }
+    return {
+      users: Array.isArray(parsed.users) ? parsed.users : [],
+      tutorStudentLinks: Array.isArray(parsed.tutorStudentLinks) ? parsed.tutorStudentLinks : [],
+      assignments: Array.isArray(parsed.assignments) ? parsed.assignments : [],
+    };
+  } catch (error) {
+    console.error("Failed to read data store, resetting:", error.message);
+    const reset = {
+      users: [],
+      tutorStudentLinks: [],
+      assignments: [],
+    };
+    fs.writeFileSync(DATA_STORE_PATH, JSON.stringify(reset, null, 2));
+    return reset;
+  }
+}
+
+function writeDataStore(store) {
+  fs.writeFileSync(DATA_STORE_PATH, JSON.stringify(store, null, 2));
+}
+
+function normalizeUserRole(role) {
+  const value = String(role || "").trim().toLowerCase();
+  if (value === "tutor" || value === "student") return value;
+  return "";
+}
+
+function sanitizeName(name) {
+  return sanitizeShortLabel(name, 80);
+}
+
+function findUserById(store, userId) {
+  return store.users.find((user) => user.id === userId) || null;
+}
+
+function normalizeAssignmentStatus(status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (["assigned", "started", "completed"].includes(value)) return value;
+  return "assigned";
+}
+
+function sanitizeSavedLessonPayload(lesson) {
+  if (!lesson || typeof lesson !== "object") return null;
+
+  const title = sanitizeShortLabel(lesson.title || "Untitled Lesson", 120);
+  const targetLanguage = sanitizeShortLabel(lesson.targetLanguage || "English", 50);
+  const baseLanguage = sanitizeShortLabel(lesson.baseLanguage || "English", 50);
+  const difficulty = normalizeDifficulty(lesson.difficulty || "beginner");
+
+  const items = Array.isArray(lesson.items)
+    ? lesson.items
+        .slice(0, 100)
+        .map((item) => ({
+          term: sanitizeShortLabel(item?.term || "", 250),
+          meaning: sanitizeShortLabel(item?.meaning || "", 250),
+          wordType: sanitizeShortLabel(item?.wordType || "other", 30),
+          promptType: normalizePromptFamily(item?.promptType || "recall"),
+          safeExampleSentences: Array.isArray(item?.safeExampleSentences)
+            ? item.safeExampleSentences.map((line) => sanitizeShortLabel(line, 250)).filter(Boolean).slice(0, 3)
+            : [],
+          exampleTranslations: Array.isArray(item?.exampleTranslations)
+            ? item.exampleTranslations.map((line) => sanitizeShortLabel(line, 250)).filter(Boolean).slice(0, 3)
+            : [],
+        }))
+        .filter((item) => item.term)
+    : [];
+
+  return {
+    id: sanitizeShortLabel(lesson.id || generateId("lesson"), 80),
+    title,
+    targetLanguage,
+    baseLanguage,
+    difficulty,
+    items,
+    createdAt: lesson.createdAt || new Date().toISOString(),
+  };
+}
+
+app.post("/users/create", (req, res) => {
+  try {
+    const { name = "", role = "" } = req.body || {};
+    const cleanName = sanitizeName(name);
+    const cleanRole = normalizeUserRole(role);
+
+    if (!cleanName) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+
+    if (!cleanRole) {
+      return res.status(400).json({ error: "Role must be tutor or student" });
+    }
+
+    const store = readDataStore();
+
+    const existing = store.users.find(
+      (user) => user.name.toLowerCase() == cleanName.toLowerCase() && user.role === cleanRole,
+    );
+
+    if (existing) {
+      return res.json({ ok: true, user: existing, existing: true });
+    }
+
+    const user = {
+      id: generateId(cleanRole),
+      name: cleanName,
+      role: cleanRole,
+      createdAt: new Date().toISOString(),
+    };
+
+    store.users.push(user);
+    writeDataStore(store);
+
+    res.json({ ok: true, user, existing: false });
+  } catch (error) {
+    console.error("users/create error:", error);
+    res.status(500).json({ error: "Failed to create user", details: error.message });
+  }
+});
+
+app.get("/users/:userId", (req, res) => {
+  try {
+    const store = readDataStore();
+    const user = findUserById(store, req.params.userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ ok: true, user });
+  } catch (error) {
+    console.error("users/:userId error:", error);
+    res.status(500).json({ error: "Failed to load user", details: error.message });
+  }
+});
+
+app.post("/students/link", (req, res) => {
+  try {
+    const { tutorId = "", studentId = "" } = req.body || {};
+    const store = readDataStore();
+
+    const tutor = findUserById(store, tutorId);
+    const student = findUserById(store, studentId);
+
+    if (!tutor || tutor.role !== "tutor") {
+      return res.status(400).json({ error: "Valid tutorId is required" });
+    }
+
+    if (!student || student.role !== "student") {
+      return res.status(400).json({ error: "Valid studentId is required" });
+    }
+
+    const existing = store.tutorStudentLinks.find(
+      (link) => link.tutorId === tutorId && link.studentId === studentId,
+    );
+
+    if (existing) {
+      return res.json({ ok: true, link: existing, existing: true });
+    }
+
+    const link = {
+      id: generateId("link"),
+      tutorId,
+      studentId,
+      createdAt: new Date().toISOString(),
+    };
+
+    store.tutorStudentLinks.push(link);
+    writeDataStore(store);
+
+    res.json({ ok: true, link, existing: false });
+  } catch (error) {
+    console.error("students/link error:", error);
+    res.status(500).json({ error: "Failed to link student", details: error.message });
+  }
+});
+
+app.get("/students/:tutorId", (req, res) => {
+  try {
+    const store = readDataStore();
+    const tutor = findUserById(store, req.params.tutorId);
+
+    if (!tutor || tutor.role !== "tutor") {
+      return res.status(400).json({ error: "Valid tutorId is required" });
+    }
+
+    const links = store.tutorStudentLinks.filter((link) => link.tutorId === tutor.id);
+    const students = links
+      .map((link) => {
+        const student = findUserById(store, link.studentId);
+        return student
+          ? {
+              ...student,
+              linkedAt: link.createdAt,
+              linkId: link.id,
+            }
+          : null;
+      })
+      .filter(Boolean);
+
+    res.json({ ok: true, tutor, students });
+  } catch (error) {
+    console.error("students/:tutorId error:", error);
+    res.status(500).json({ error: "Failed to load students", details: error.message });
+  }
+});
+
+app.post("/assignments/create", (req, res) => {
+  try {
+    const {
+      tutorId = "",
+      studentId = "",
+      title = "",
+      lesson = null,
+    } = req.body || {};
+
+    const store = readDataStore();
+    const tutor = findUserById(store, tutorId);
+    const student = findUserById(store, studentId);
+
+    if (!tutor || tutor.role !== "tutor") {
+      return res.status(400).json({ error: "Valid tutorId is required" });
+    }
+
+    if (!student || student.role !== "student") {
+      return res.status(400).json({ error: "Valid studentId is required" });
+    }
+
+    const linked = store.tutorStudentLinks.some(
+      (link) => link.tutorId === tutorId && link.studentId === studentId,
+    );
+
+    if (!linked) {
+      return res.status(400).json({ error: "Tutor and student are not linked" });
+    }
+
+    const cleanLesson = sanitizeSavedLessonPayload(lesson);
+    if (!cleanLesson || !Array.isArray(cleanLesson.items) || cleanLesson.items.length === 0) {
+      return res.status(400).json({ error: "Valid lesson payload is required" });
+    }
+
+    const assignment = {
+      id: generateId("assignment"),
+      tutorId,
+      tutorName: tutor.name,
+      studentId,
+      studentName: student.name,
+      title: sanitizeShortLabel(title || cleanLesson.title || "Homework", 120),
+      lesson: cleanLesson,
+      status: "assigned",
+      assignedAt: new Date().toISOString(),
+      startedAt: null,
+      completedAt: null,
+    };
+
+    store.assignments.push(assignment);
+    writeDataStore(store);
+
+    res.json({ ok: true, assignment });
+  } catch (error) {
+    console.error("assignments/create error:", error);
+    res.status(500).json({ error: "Failed to create assignment", details: error.message });
+  }
+});
+
+app.get("/assignments/student/:studentId", (req, res) => {
+  try {
+    const store = readDataStore();
+    const student = findUserById(store, req.params.studentId);
+
+    if (!student || student.role !== "student") {
+      return res.status(400).json({ error: "Valid studentId is required" });
+    }
+
+    const assignments = store.assignments
+      .filter((assignment) => assignment.studentId === student.id)
+      .sort((a, b) => new Date(b.assignedAt).getTime() - new Date(a.assignedAt).getTime());
+
+    res.json({ ok: true, student, assignments });
+  } catch (error) {
+    console.error("assignments/student error:", error);
+    res.status(500).json({ error: "Failed to load student assignments", details: error.message });
+  }
+});
+
+app.get("/assignments/tutor/:tutorId", (req, res) => {
+  try {
+    const store = readDataStore();
+    const tutor = findUserById(store, req.params.tutorId);
+
+    if (!tutor || tutor.role !== "tutor") {
+      return res.status(400).json({ error: "Valid tutorId is required" });
+    }
+
+    const assignments = store.assignments
+      .filter((assignment) => assignment.tutorId === tutor.id)
+      .sort((a, b) => new Date(b.assignedAt).getTime() - new Date(a.assignedAt).getTime());
+
+    res.json({ ok: true, tutor, assignments });
+  } catch (error) {
+    console.error("assignments/tutor error:", error);
+    res.status(500).json({ error: "Failed to load tutor assignments", details: error.message });
+  }
+});
+
+app.post("/assignments/started", (req, res) => {
+  try {
+    const { assignmentId = "" } = req.body || {};
+    const store = readDataStore();
+    const assignment = store.assignments.find((entry) => entry.id === assignmentId);
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    if (assignment.status === "assigned") {
+      assignment.status = "started";
+      assignment.startedAt = assignment.startedAt || new Date().toISOString();
+      writeDataStore(store);
+    }
+
+    res.json({ ok: true, assignment });
+  } catch (error) {
+    console.error("assignments/started error:", error);
+    res.status(500).json({ error: "Failed to mark assignment started", details: error.message });
+  }
+});
+
+app.post("/assignments/complete", (req, res) => {
+  try {
+    const { assignmentId = "" } = req.body || {};
+    const store = readDataStore();
+    const assignment = store.assignments.find((entry) => entry.id === assignmentId);
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    assignment.status = "completed";
+    assignment.startedAt = assignment.startedAt || new Date().toISOString();
+    assignment.completedAt = new Date().toISOString();
+    writeDataStore(store);
+
+    res.json({ ok: true, assignment });
+  } catch (error) {
+    console.error("assignments/complete error:", error);
+    res.status(500).json({ error: "Failed to mark assignment completed", details: error.message });
+  }
+});
+
+app.get("/mvp/debug/store", (req, res) => {
+  try {
+    const store = readDataStore();
+    res.json({ ok: true, store });
+  } catch (error) {
+    console.error("mvp/debug/store error:", error);
+    res.status(500).json({ error: "Failed to load debug store", details: error.message });
+  }
+});
+
+ensureDataStore();
+
 /* -------------------------------------------------------------------------- */
 /*                                  Startup                                   */
 /* -------------------------------------------------------------------------- */
