@@ -1491,6 +1491,27 @@ function sanitizeName(name) {
   return sanitizeShortLabel(name, 80);
 }
 
+function generateShortCode(length = 5) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let result = "";
+  for (let i = 0; i < length; i += 1) {
+    const index = crypto.randomInt(0, alphabet.length);
+    result += alphabet[index];
+  }
+  return result;
+}
+
+function generateUniqueUserCode(store, length = 5) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const code = generateShortCode(length);
+    const exists = store.users.some(
+      (user) => String(user.joinCode || "").toUpperCase() === code,
+    );
+    if (!exists) return code;
+  }
+  return generateShortCode(6);
+}
+
 function findUserById(store, userId) {
   return store.users.find((user) => user.id === userId) || null;
 }
@@ -1559,11 +1580,16 @@ app.post("/users/create", (req, res) => {
     );
 
     if (existing) {
+      if (!existing.joinCode) {
+        existing.joinCode = generateUniqueUserCode(store);
+        writeDataStore(store);
+      }
       return res.json({ ok: true, user: existing, existing: true });
     }
 
     const user = {
       id: generateId(cleanRole),
+      joinCode: generateUniqueUserCode(store),
       name: cleanName,
       role: cleanRole,
       createdAt: new Date().toISOString(),
@@ -1595,22 +1621,30 @@ app.get("/users/:userId", (req, res) => {
 
 app.post("/students/link", (req, res) => {
   try {
-    const { tutorId = "", studentId = "" } = req.body || {};
+    const { tutorId = "", studentId = "", studentCode = "" } = req.body || {};
     const store = readDataStore();
 
     const tutor = findUserById(store, tutorId);
-    const student = findUserById(store, studentId);
+    const normalizedCode = String(studentCode || "").trim().toUpperCase();
+    const student =
+      findUserById(store, studentId) ||
+      store.users.find(
+        (user) =>
+          user.role === "student" &&
+          String(user.joinCode || "").toUpperCase() === normalizedCode,
+      ) ||
+      null;
 
     if (!tutor || tutor.role !== "tutor") {
       return res.status(400).json({ error: "Valid tutorId is required" });
     }
 
     if (!student || student.role !== "student") {
-      return res.status(400).json({ error: "Valid studentId is required" });
+      return res.status(400).json({ error: "Valid student code or studentId is required" });
     }
 
     const existing = store.tutorStudentLinks.find(
-      (link) => link.tutorId === tutorId && link.studentId === studentId,
+      (link) => link.tutorId === tutorId && link.studentId === student.id,
     );
 
     if (existing) {
@@ -1620,7 +1654,8 @@ app.post("/students/link", (req, res) => {
     const link = {
       id: generateId("link"),
       tutorId,
-      studentId,
+      studentId: student.id,
+      studentCode: student.joinCode || null,
       createdAt: new Date().toISOString(),
     };
 
@@ -1652,6 +1687,7 @@ app.get("/students/:tutorId", (req, res) => {
               ...student,
               linkedAt: link.createdAt,
               linkId: link.id,
+              joinCode: student.joinCode || null,
             }
           : null;
       })
@@ -1670,6 +1706,7 @@ app.post("/assignments/create", (req, res) => {
       tutorId = "",
       studentId = "",
       title = "",
+      note = "",
       lesson = null,
     } = req.body || {};
 
@@ -1705,11 +1742,15 @@ app.post("/assignments/create", (req, res) => {
       studentId,
       studentName: student.name,
       title: sanitizeShortLabel(title || cleanLesson.title || "Homework", 120),
+      note: sanitizeShortLabel(note || "", 220),
       lesson: cleanLesson,
       status: "assigned",
       assignedAt: new Date().toISOString(),
       startedAt: null,
       completedAt: null,
+      selfRatings: [],
+      reviewNeededWords: [],
+      highReplayWords: [],
     };
 
     store.assignments.push(assignment);
@@ -1787,7 +1828,7 @@ app.post("/assignments/started", (req, res) => {
 
 app.post("/assignments/complete", (req, res) => {
   try {
-    const { assignmentId = "" } = req.body || {};
+    const { assignmentId = "", selfRatings = [], highReplayWords = [] } = req.body || {};
     const store = readDataStore();
     const assignment = store.assignments.find((entry) => entry.id === assignmentId);
 
@@ -1795,9 +1836,37 @@ app.post("/assignments/complete", (req, res) => {
       return res.status(404).json({ error: "Assignment not found" });
     }
 
+    const sanitizedRatings = Array.isArray(selfRatings)
+      ? selfRatings
+          .slice(0, 250)
+          .map((entry) => ({
+            term: sanitizeShortLabel(entry?.term || "", 250),
+            meaning: sanitizeShortLabel(entry?.meaning || "", 250),
+            rating: ["easy", "okay", "hard"].includes(String(entry?.rating || "").toLowerCase())
+              ? String(entry.rating).toLowerCase()
+              : "okay",
+          }))
+          .filter((entry) => entry.term)
+      : [];
+
+    const sanitizedHighReplayWords = Array.isArray(highReplayWords)
+      ? highReplayWords
+          .slice(0, 100)
+          .map((entry) => ({
+            term: sanitizeShortLabel(entry?.term || "", 250),
+            replayCount: Math.max(1, Number(entry?.replayCount || 0) || 0),
+          }))
+          .filter((entry) => entry.term)
+      : [];
+
     assignment.status = "completed";
     assignment.startedAt = assignment.startedAt || new Date().toISOString();
     assignment.completedAt = new Date().toISOString();
+    assignment.selfRatings = sanitizedRatings;
+    assignment.reviewNeededWords = sanitizedRatings
+      .filter((entry) => entry.rating === "hard")
+      .map((entry) => entry.term);
+    assignment.highReplayWords = sanitizedHighReplayWords;
     writeDataStore(store);
 
     res.json({ ok: true, assignment });
